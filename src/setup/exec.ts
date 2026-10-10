@@ -4,6 +4,82 @@ import { StringDecoder } from "node:string_decoder";
 import type { Secret } from "./secret.js";
 import { redact } from "./secret.js";
 
+/** Windows has no process groups, so the group-wide kill below is POSIX-only. */
+const POSIX = process.platform !== "win32";
+
+/** How long the child has to honour SIGTERM before it is SIGKILLed. */
+const KILL_ESCALATION_MS = 2000;
+
+/**
+ * The process groups of children spawned `detached`.
+ *
+ * A detached child leads its own group, which is not the terminal's foreground
+ * group, so Ctrl+C no longer reaches it — before this module detached anything,
+ * the terminal signalled the CLI's whole group and the child died with the run.
+ * Forwarding the signal to these groups restores exactly that, so a cancelled
+ * run cannot leave a child behind.
+ */
+const detachedGroups = new Set<number>();
+let forwarding = false;
+
+/**
+ * Signals a whole process group, reporting whether anything was there.
+ *
+ * `process.kill` throws ESRCH once the last member has exited, which is the
+ * ordinary case for a kill that races the child's own exit, not an error. With
+ * signal 0 this is just an existence probe.
+ */
+function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
+  try {
+    process.kill(-pgid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function forwardTerminalSignal(signal: NodeJS.Signals): void {
+  for (const pgid of detachedGroups) {
+    signalGroup(pgid, signal);
+  }
+  detachedGroups.clear();
+  stopForwarding();
+  if (process.listenerCount(signal) === 0) {
+    // Nothing else handles it, so Node would have terminated the CLI on
+    // delivery. Re-raise now that this handler is out of the way, so Ctrl+C
+    // still ends the run with the status it always had instead of being
+    // swallowed here.
+    process.kill(process.pid, signal);
+  }
+}
+
+const terminalHandlers: ReadonlyMap<NodeJS.Signals, () => void> = new Map(
+  (["SIGINT", "SIGTERM", "SIGHUP"] as const).map((signal) => [
+    signal,
+    () => forwardTerminalSignal(signal),
+  ]),
+);
+
+function startForwarding(): void {
+  if (forwarding) {
+    return;
+  }
+  forwarding = true;
+  for (const [signal, handler] of terminalHandlers) {
+    process.on(signal, handler);
+  }
+}
+
+function stopForwarding(): void {
+  if (!forwarding) {
+    return;
+  }
+  forwarding = false;
+  for (const [signal, handler] of terminalHandlers) {
+    process.off(signal, handler);
+  }
+}
+
 export interface RunProcessOptions {
   program: string;
   args: string[];
@@ -52,8 +128,9 @@ export type RunProcess = (options: RunProcessOptions) => Promise<RunProcessResul
  * ordinary outcomes for the stages that call this, and each needs to report a
  * different message. Only programmer errors propagate.
  *
- * A timeout or an abort escalates SIGTERM → SIGKILL so a wedged agent cannot
- * hold the terminal indefinitely.
+ * A timeout or an abort escalates SIGTERM → SIGKILL across the child's whole
+ * process group, so a wedged agent cannot hold the terminal indefinitely and
+ * cannot survive by way of a grandchild.
  */
 export const runProcess: RunProcess = (options) =>
   new Promise<RunProcessResult>((resolve) => {
@@ -64,11 +141,20 @@ export const runProcess: RunProcess = (options) =>
     let chunks = "";
     const decoders: StringDecoder[] = [];
 
+    // Only captured runs are detached. `inherit` hands the terminal to an
+    // interactive agent, and a new session would take that child out of the
+    // terminal's foreground group: Ctrl+C would stop reaching it and it would
+    // be racing the CLI for stdin. A captured child has no stake in the
+    // terminal, so its own group costs nothing and is what makes the kill
+    // reach the grandchildren that hold the pipes open.
+    const detached = capture && POSIX;
+
     let child: ChildProcess;
     try {
       child = spawn(options.program, options.args, {
         cwd: options.cwd,
         env: options.env,
+        detached,
         stdio: capture
           ? [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"]
           : [options.stdin === undefined ? "inherit" : "pipe", "inherit", "inherit"],
@@ -81,6 +167,14 @@ export const runProcess: RunProcess = (options) =>
         timedOut: false,
         spawnFailed: true,
       });
+    }
+
+    // A detached child leads a group whose id is its pid. Undefined when the
+    // spawn failed outright, in which case there is nothing to signal.
+    const pgid = detached ? child.pid : undefined;
+    if (pgid !== undefined) {
+      detachedGroups.add(pgid);
+      startForwarding();
     }
 
     const finish = (exitCode: number, spawnFailed = false): void => {
@@ -105,6 +199,12 @@ export const runProcess: RunProcess = (options) =>
         }
       }
       clearTimeout(timer);
+      if (pgid !== undefined) {
+        detachedGroups.delete(pgid);
+        if (detachedGroups.size === 0) {
+          stopForwarding();
+        }
+      }
       options.signal?.removeEventListener("abort", onAbort);
       resolve({
         exitCode,
@@ -115,14 +215,28 @@ export const runProcess: RunProcess = (options) =>
       });
     };
 
+    /**
+     * Signals the child, and on POSIX its whole process group.
+     *
+     * `child.kill` reaches only the direct child, so a grandchild survived it
+     * and kept both the work and the stdio pipes alive.
+     */
+    const signalChild = (signal: NodeJS.Signals): void => {
+      if (pgid !== undefined) {
+        signalGroup(pgid, signal);
+        return;
+      }
+      child.kill(signal);
+    };
+
     const kill = (): void => {
-      child.kill("SIGTERM");
+      signalChild("SIGTERM");
       // A child that ignores SIGTERM would otherwise keep the CLI alive.
       setTimeout(() => {
         if (!settled) {
-          child.kill("SIGKILL");
+          signalChild("SIGKILL");
         }
-      }, 2000).unref?.();
+      }, KILL_ESCALATION_MS).unref?.();
     };
 
     const onAbort = (): void => {

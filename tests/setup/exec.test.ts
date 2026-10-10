@@ -1,9 +1,34 @@
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runProcess } from "../../src/setup/exec.js";
 import { makeSecret } from "../../src/setup/secret.js";
 
 const NODE = process.execPath;
 const KEY = "tr-secret-value-long-enough";
+/** Process groups are POSIX-only, so the group-wide kill is too. */
+const WINDOWS = process.platform === "win32";
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+const workspace = (): Promise<string> => mkdtemp(join(tmpdir(), "traceroot-exec-"));
+
+function shell(script: string, extra: Record<string, unknown> = {}) {
+  return {
+    program: "sh",
+    args: ["-c", script],
+    cwd: process.cwd(),
+    env: { PATH: process.env.PATH ?? "" },
+    stdio: "capture" as const,
+    ...extra,
+  };
+}
 
 function opts(script: string, extra: Record<string, unknown> = {}) {
   return {
@@ -100,4 +125,152 @@ describe("a process that ends mid-character", () => {
     expect(chunks.join("")).toBe(result.output);
     expect(result.output.startsWith("caf")).toBe(true);
   }, 10000);
+});
+
+describe("a timeout the child's own children cannot outlast", () => {
+  it.skipIf(WINDOWS)("fires while a grandchild is still holding the pipes open", async () => {
+    // `close` fires only once every holder of the stdio pipes has closed them,
+    // and a grandchild inherits them — so this resolved after the full eight
+    // seconds, with `timedOut: true` but half a minute late. The stage that
+    // runs the project's test command would never have timed out at all for
+    // any `npm test` or `pytest` that starts a server or a watcher.
+    const started = Date.now();
+    const result = await runProcess(shell("sleep 8 & sleep 8", { timeoutMs: 500 }));
+
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it.skipIf(WINDOWS)("takes the grandchild down rather than leaving it running", async () => {
+    // `child.kill` signals only the direct child, so the grandchild survived
+    // the timeout along with whatever port or lock it was holding. The marker
+    // is written a second after the kill, so it exists only if it survived.
+    const dir = await workspace();
+    const marker = join(dir, "survived");
+
+    const result = await runProcess(
+      shell(`sh -c 'sleep 1; : > "${marker}"' & sleep 8`, { timeoutMs: 300 }),
+    );
+    await sleep(1500);
+
+    expect(result.timedOut).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.skipIf(WINDOWS)("escalates to SIGKILL when nothing in the tree honours SIGTERM", async () => {
+    // An ignored signal survives `exec`, so neither the shell nor its `sleep`
+    // takes this SIGTERM. Gating the escalation on the promise would skip it
+    // exactly here, now that the promise settles once the direct child exits.
+    const started = Date.now();
+    const result = await runProcess(shell('trap "" TERM; sleep 10', { timeoutMs: 300 }));
+
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).toBe(128 + 9);
+    expect(Date.now() - started).toBeLessThan(6000);
+  });
+
+  it("does not throw when the escalation lands on a group that has already gone", async () => {
+    // `process.kill(-pid, …)` throws ESRCH once the group is empty, and the
+    // escalation probes it two seconds after the SIGTERM — long after this run
+    // settled, so an unhandled one surfaces as an uncaught error rather than a
+    // rejected promise.
+    const errors: unknown[] = [];
+    const record = (error: unknown): void => {
+      errors.push(error);
+    };
+
+    process.on("uncaughtException", record);
+    try {
+      const result = await runProcess(opts("setTimeout(() => {}, 10000)", { timeoutMs: 200 }));
+      expect(result.timedOut).toBe(true);
+      await sleep(2600);
+    } finally {
+      process.off("uncaughtException", record);
+    }
+
+    expect(errors).toEqual([]);
+  }, 15000);
+});
+
+describe("settling once the child exits rather than once the pipes close", () => {
+  it("still hands back the whole of a long output", async () => {
+    // The bounded drain is what makes settling on `exit` safe: the pipe can
+    // still hold what the child wrote just before exiting, and dropping it
+    // would silently truncate the tail of a captured test run.
+    const script = [
+      'const line = "x".repeat(99) + "\\n";',
+      "for (let i = 0; i < 20000; i += 1) process.stdout.write(line);",
+    ].join("");
+
+    const chunks: string[] = [];
+    const result = await runProcess(opts(script, { onData: (c: string) => chunks.push(c) }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.output.length).toBe(20000 * 100);
+    expect(chunks.join("")).toBe(result.output);
+  });
+
+  it("leaves no signal handler behind once the run is over", async () => {
+    // The forwarding handler below exists only while a detached child does. A
+    // permanent one would change how the CLI itself answers Ctrl+C.
+    const before = process.listenerCount("SIGINT");
+
+    await runProcess(opts('console.log("done")'));
+
+    expect(process.listenerCount("SIGINT")).toBe(before);
+  });
+});
+
+describe("a Ctrl+C part-way through a captured run", () => {
+  it.skipIf(WINDOWS)(
+    "kills the detached child and still ends the CLI",
+    async () => {
+      // A detached child is not in the terminal's foreground group, so Ctrl+C
+      // reaches the CLI alone — which is what this harness reproduces by
+      // signalling only its own pid. The child must not outlive the cancelled
+      // run, and the signal must still end the CLI with the status it always had.
+      const dir = await workspace();
+      const marker = join(dir, "survived");
+      const grandchild = join(dir, "grandchild.cjs");
+      const child = join(dir, "child.cjs");
+      const harness = join(dir, "harness.mjs");
+      const module = new URL("../../dist/setup/exec.js", import.meta.url).href;
+
+      await writeFile(
+        grandchild,
+        'setTimeout(() => require("node:fs").writeFileSync(process.argv[2], "late"), 1500);',
+      );
+      await writeFile(
+        child,
+        [
+          'const { spawn } = require("node:child_process");',
+          // `inherit`, so this is the grandchild that holds the pipes open.
+          'spawn(process.execPath, [process.argv[2], process.argv[3]], { stdio: "inherit" });',
+          "setTimeout(() => {}, 8000);",
+        ].join("\n"),
+      );
+      await writeFile(
+        harness,
+        [
+          `const { runProcess } = await import(${JSON.stringify(module)});`,
+          "const run = runProcess({",
+          "  program: process.execPath,",
+          `  args: [${JSON.stringify(child)}, ${JSON.stringify(grandchild)}, ${JSON.stringify(marker)}],`,
+          `  cwd: ${JSON.stringify(dir)},`,
+          '  env: { PATH: process.env.PATH ?? "" },',
+          '  stdio: "capture",',
+          "});",
+          'setTimeout(() => process.kill(process.pid, "SIGINT"), 400);',
+          "await run;",
+        ].join("\n"),
+      );
+
+      const result = spawnSync(process.execPath, [harness], { encoding: "utf8" });
+      await sleep(2000);
+
+      expect(result.signal).toBe("SIGINT");
+      expect(existsSync(marker)).toBe(false);
+    },
+    15000,
+  );
 });
