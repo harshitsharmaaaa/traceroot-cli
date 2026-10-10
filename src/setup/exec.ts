@@ -7,6 +7,19 @@ import { redact } from "./secret.js";
 /** Windows has no process groups, so the group-wide kill below is POSIX-only. */
 const POSIX = process.platform !== "win32";
 
+/**
+ * How long the stdio pipes may keep draining once the child itself has exited.
+ *
+ * `close` fires only after every holder of those pipes has closed them, and a
+ * grandchild inherits them: `sh -c "sleep 8 & sleep 8"` holds them for the full
+ * eight seconds, long past any timeout. So a test command that starts a server
+ * or a watcher made the ten-minute verification timeout never fire at all.
+ * Settling on `exit` instead needs this grace period, because the pipe can
+ * still hold bytes the child wrote just before exiting; whatever has not
+ * arrived by then is being written by a survivor this run has given up on.
+ */
+const DRAIN_GRACE_MS = 250;
+
 /** How long the child has to honour SIGTERM before it is SIGKILLed. */
 const KILL_ESCALATION_MS = 2000;
 
@@ -121,6 +134,18 @@ export interface RunProcessResult {
 /** Injectable process runner, so every stage that shells out stays testable. */
 export type RunProcess = (options: RunProcessOptions) => Promise<RunProcessResult>;
 
+/** The conventional 128+n for a signalled exit, which has a null code. */
+function statusFor(code: number | null, signalName: NodeJS.Signals | null): number {
+  if (code !== null) {
+    return code;
+  }
+  // Reporting the signal lets the caller still distinguish "killed" from
+  // "exited cleanly", and which signal did it — the timeout and abort paths
+  // here send SIGTERM (143), not Ctrl+C (130).
+  const number = signalName === null ? undefined : osConstants.signals[signalName];
+  return number === undefined ? 1 : 128 + number;
+}
+
 /**
  * Runs a child process to completion.
  *
@@ -138,6 +163,7 @@ export const runProcess: RunProcess = (options) =>
     const capture = options.stdio === "capture";
     let settled = false;
     let timedOut = false;
+    let exited = false;
     let chunks = "";
     const decoders: StringDecoder[] = [];
 
@@ -177,6 +203,8 @@ export const runProcess: RunProcess = (options) =>
       startForwarding();
     }
 
+    let drainTimer: NodeJS.Timeout | undefined;
+
     const finish = (exitCode: number, spawnFailed = false): void => {
       if (settled) {
         return;
@@ -199,6 +227,7 @@ export const runProcess: RunProcess = (options) =>
         }
       }
       clearTimeout(timer);
+      clearTimeout(drainTimer);
       if (pgid !== undefined) {
         detachedGroups.delete(pgid);
         if (detachedGroups.size === 0) {
@@ -229,11 +258,17 @@ export const runProcess: RunProcess = (options) =>
       child.kill(signal);
     };
 
+    /** True while anything this run started is still running. */
+    const stillRunning = (): boolean => (pgid === undefined ? !exited : signalGroup(pgid, 0));
+
     const kill = (): void => {
       signalChild("SIGTERM");
-      // A child that ignores SIGTERM would otherwise keep the CLI alive.
       setTimeout(() => {
-        if (!settled) {
+        // Gated on the group rather than on the promise: the promise now
+        // settles shortly after the direct child exits, which is exactly when
+        // a grandchild that ignored SIGTERM is still running and still needs
+        // escalating.
+        if (stillRunning()) {
           signalChild("SIGKILL");
         }
       }, KILL_ESCALATION_MS).unref?.();
@@ -293,18 +328,25 @@ export const runProcess: RunProcess = (options) =>
     }
 
     child.on("error", () => finish(127, true));
-    child.on("close", (code, signalName) => {
-      if (code !== null) {
-        finish(code);
+    child.on("exit", (code, signalName) => {
+      exited = true;
+      const status = statusFor(code, signalName);
+      if (!capture) {
+        finish(status);
         return;
       }
-      // A signalled exit has a null code; report the conventional 128+n so the
-      // caller can still distinguish "killed" from "exited cleanly", and which
-      // signal did it — the timeout and abort paths here send SIGTERM (143),
-      // not Ctrl+C (130).
-      const number = signalName === null ? undefined : osConstants.signals[signalName];
-      finish(number === undefined ? 1 : 128 + number);
+      // `close` below is the normal settle path and fires within a tick or two
+      // of this, which is why the grace period costs an ordinary run nothing.
+      // This timer is the backstop for the run where it never fires at all
+      // because a survivor is holding the pipes.
+      drainTimer = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        finish(status);
+      }, DRAIN_GRACE_MS);
     });
+    child.on("close", (code, signalName) => finish(statusFor(code, signalName)));
   });
 
 /**

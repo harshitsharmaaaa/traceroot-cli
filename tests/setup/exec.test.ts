@@ -193,6 +193,40 @@ describe("a timeout the child's own children cannot outlast", () => {
 });
 
 describe("settling once the child exits rather than once the pipes close", () => {
+  it.skipIf(WINDOWS)("settles even when a survivor has left the process group", async () => {
+    // Killing the group is not enough on its own: a grandchild spawned
+    // `detached` leads a session of its own, so no group signal reaches it, and
+    // it holds the pipes long after the child this run spawned is gone. Only
+    // settling on `exit` bounds the wait.
+    const dir = await workspace();
+    const escapee = join(dir, "escapee.cjs");
+    const child = join(dir, "child.cjs");
+    await writeFile(escapee, "setTimeout(() => {}, 4000);");
+    await writeFile(
+      child,
+      [
+        'const { spawn } = require("node:child_process");',
+        // `detached`, so the kill below cannot reach it; `inherit`, so it is
+        // holding this run's stdio pipes open the whole time.
+        'spawn(process.execPath, [process.argv[2]], { stdio: "inherit", detached: true });',
+        "setTimeout(() => {}, 4000);",
+      ].join("\n"),
+    );
+
+    const started = Date.now();
+    const result = await runProcess({
+      program: process.execPath,
+      args: [child, escapee],
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? "" },
+      stdio: "capture",
+      timeoutMs: 500,
+    });
+
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
   it("still hands back the whole of a long output", async () => {
     // The bounded drain is what makes settling on `exit` safe: the pipe can
     // still hold what the child wrote just before exiting, and dropping it
