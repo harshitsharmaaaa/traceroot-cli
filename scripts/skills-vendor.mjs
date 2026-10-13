@@ -56,6 +56,17 @@ export function sha256(contents) {
  * `readdirSync` reports entry types from an `lstat`, so a symlink is reported as
  * neither a file nor a directory here however it resolves.
  */
+/**
+ * Names npm never packs, so neither check should ever see them. `npm-packlist`
+ * injects these unconditionally through its `defaults` rule set, so a
+ * Finder-created `.DS_Store` under assets/skills/ would otherwise be recorded
+ * and compared while being absent from every tarball — failing both checks
+ * with remedies that cannot work: `skills:check` would blame a hand edit, and
+ * `pack:check` would blame `files` in package.json, which can never bring one
+ * back. Kept to npm's own list so the walk stays a function of what ships.
+ */
+const neverPacked = (name) => name === ".DS_Store" || name.startsWith("._");
+
 export function readTree(dir) {
   const files = new Map();
   if (!existsSync(dir)) {
@@ -68,6 +79,12 @@ export function readTree(dir) {
     for (const entry of entries) {
       const absolute = join(current, entry.name);
       const path = relative(dir, absolute).split(sep).join("/");
+      // Before the symlink and regular-file checks below: npm drops these
+      // whatever they are, so one cannot reach a tarball and neither check
+      // has anything to say about it.
+      if (neverPacked(entry.name)) {
+        continue;
+      }
       if (entry.isSymbolicLink()) {
         fail(
           `${path} under ${dir} is a symlink — skill bundles hold plain files, and \`skills install\` refuses a bundle containing one. Delete it and re-vendor the tree.`,

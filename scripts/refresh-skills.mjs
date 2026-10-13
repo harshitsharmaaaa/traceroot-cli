@@ -83,17 +83,43 @@ if (!/^[0-9a-f]{40}$/.test(commit)) {
   fail(`git resolved ${ref} to ${JSON.stringify(commit)}, which is not a commit SHA.`);
 }
 
-// A record is only useful if someone else can fetch the commit it names. A
-// commit on a local-only branch resolves here and verifies forever afterwards
-// while pointing at nothing anyone can look up, so say so — loudly enough to
-// notice, without blocking a refresh done ahead of pushing upstream.
-const onRemote = spawnSync("git", ["-C", cloneArg, "branch", "-r", "--contains", commit], {
-  encoding: "utf8",
-});
-if (onRemote.status === 0 && onRemote.stdout.trim() === "") {
+// A record is only useful if someone else can fetch the commit it names, and
+// "on some remote-tracking branch" is not that: a commit living only on an
+// open pull request's branch passes such a test and then stops being
+// reachable the moment that pull request is squash-merged and its branch
+// deleted, leaving `skills:check` verifying the copy against a commit nobody
+// can fetch. So test reachability from origin's default branch instead, and
+// keep it a warning rather than a refusal so a refresh can still be run ahead
+// of merging.
+const originHead = spawnSync(
+  "git",
+  ["-C", cloneArg, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+  { encoding: "utf8" },
+);
+if (originHead.status !== 0 || originHead.stdout.trim() === "") {
+  // `origin/HEAD` is written by `git clone` and left stale by a default-branch
+  // rename, so its absence says nothing about the commit either way.
   process.stderr.write(
-    `warning: ${commit} is not on any remote-tracking branch in ${cloneArg}, so the recorded commit cannot be fetched from the skills repository yet. Push it before this record is relied on.\n`,
+    `warning: ${cloneArg} has no origin/HEAD, so whether ${commit} has landed on the skills repository's default branch could not be checked. Run \`git -C ${cloneArg} remote set-head origin -a\` and re-run to get that check.\n`,
   );
+} else {
+  const target = originHead.stdout.trim();
+  const reachable = spawnSync(
+    "git",
+    ["-C", cloneArg, "merge-base", "--is-ancestor", commit, target],
+    { encoding: "utf8" },
+  );
+  // 0 = ancestor, 1 = not an ancestor, 128 = a ref could not be read. Only 1
+  // is evidence that the commit is unreachable.
+  if (reachable.status === 1) {
+    process.stderr.write(
+      `warning: ${commit} has not landed on ${target} in ${cloneArg}, so it may be on a branch that disappears when its pull request merges. Record a commit that is on ${target} before this pin is relied on.\n`,
+    );
+  } else if (reachable.status !== 0) {
+    process.stderr.write(
+      `warning: could not check whether ${commit} has landed on ${target} in ${cloneArg} (git exited ${reachable.status}).\n`,
+    );
+  }
 }
 
 /** `owner/repo` for the clone's `origin`, which is where the vendored bytes came from. */
@@ -112,6 +138,17 @@ function repositorySlug() {
 }
 
 const repository = repositorySlug();
+
+// The record names the repository the bytes came from, and nothing downstream
+// checks the value — the provenance check only requires it to be a non-empty
+// string — so a refresh run in a fork's clone would record the fork and pass
+// CI, pinning a commit the skills repository does not have.
+const EXPECTED_REPOSITORY = "traceroot-ai/traceroot-skills";
+if (repository.toLowerCase() !== EXPECTED_REPOSITORY) {
+  fail(
+    `${cloneArg}'s \`origin\` is ${repository}, not ${EXPECTED_REPOSITORY} — vendoring from a fork records a commit the skills repository cannot serve. Point the clone's \`origin\` at ${EXPECTED_REPOSITORY}, or pass a canonical clone.`,
+  );
+}
 
 /** One blob at `commit`, as bytes. */
 const blob = (path) =>
