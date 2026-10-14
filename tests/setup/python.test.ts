@@ -63,6 +63,22 @@ describe("finding the Python a service actually runs on", () => {
   });
 });
 
+/**
+ * Runs `fn` with the platform reported as Windows.
+ *
+ * The case-folding branch is Windows-only and CI runs on Linux, so without
+ * this the half of the behaviour that exists for Windows is never executed.
+ */
+function onWindows<T>(fn: () => T): T {
+  const real = process.platform;
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    return fn();
+  } finally {
+    Object.defineProperty(process, "platform", { value: real, configurable: true });
+  }
+}
+
 describe("running a project's own commands in its virtualenv", () => {
   it("puts the interpreter's directory first, so a venv script wins over a global one", () => {
     // The failure this prevents: `detect_stack` names `pytest`, which exists
@@ -81,20 +97,51 @@ describe("running a project's own commands in its virtualenv", () => {
     expect(withVenvOnPath(parent, null)).toBe(parent);
   });
 
-  it("collapses every spelling of PATH into one key", () => {
-    // A spread copy of process.env is a plain object with no case folding, so a
-    // Windows child could be handed both `Path` and `PATH`. Which one wins is
-    // the host's business; writing one and leaving the other is a bet on that
-    // answer, and losing it means the virtualenv never reaches the child —
-    // exactly the ENOENT this function exists to prevent. One key, no bet.
-    const env = withVenvOnPath({ Path: "C:\\Windows" }, "/repo/.venv/bin/python");
+  it("leaves another spelling of PATH alone on POSIX, where it is another variable", () => {
+    // `Path` is not an alias here: a child spawned with only `Path` set cannot
+    // find a program in the directory it names, which is why POSIX lookup is
+    // `PATH` or nothing. Deleting the others throws away variables this
+    // function was never asked about.
+    const env = withVenvOnPath(
+      { PATH: "/usr/bin", Path: "/opt/vendor/Path" },
+      "/repo/.venv/bin/python",
+    );
+
+    expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
+    expect(env.Path).toBe("/opt/vendor/Path");
+  });
+
+  it("never prepends the venv to another spelling's value on POSIX", () => {
+    // The order matters: picking the first spelling that happens to carry a
+    // value puts `Path` ahead of `PATH` here, and the child is left with a
+    // search path assembled out of a variable that was never one — the real
+    // `/usr/bin` gone, so nothing but the venv resolves.
+    const env = withVenvOnPath(
+      { Path: "/opt/vendor/Path", PATH: "/usr/bin" },
+      "/repo/.venv/bin/python",
+    );
+
+    expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
+    expect(env.Path).toBe("/opt/vendor/Path");
+  });
+
+  it("collapses every spelling of PATH into one key on Windows", () => {
+    // There they really are one variable, and a spread copy of process.env is
+    // a plain object with no case folding, so the child could be handed both
+    // `Path` and `PATH`. Which one wins is the host's business; writing one and
+    // leaving the other is a bet on that answer, and losing it means the
+    // virtualenv never reaches the child — exactly the ENOENT this function
+    // exists to prevent. One key, no bet.
+    const env = onWindows(() => withVenvOnPath({ Path: "C:\\Windows" }, "/repo/.venv/bin/python"));
 
     expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}C:\\Windows`);
     expect("Path" in env).toBe(false);
   });
 
-  it("keeps the inherited value when two spellings disagree", () => {
-    const env = withVenvOnPath({ PATH: "/usr/bin", Path: "" }, "/repo/.venv/bin/python");
+  it("keeps the inherited value when two Windows spellings disagree", () => {
+    const env = onWindows(() =>
+      withVenvOnPath({ PATH: "/usr/bin", Path: "" }, "/repo/.venv/bin/python"),
+    );
 
     expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
     expect(Object.keys(env).filter((k) => k.toUpperCase() === "PATH")).toEqual(["PATH"]);

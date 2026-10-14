@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
@@ -2853,6 +2853,23 @@ function applicationCredentialFiles(ctx: SetupContext): string[] {
   return files;
 }
 
+/**
+ * Whether a path can be a child's working directory.
+ *
+ * Existence is not the question `cwd` asks: `spawn` refuses a file with
+ * ENOTDIR as surely as it refuses a missing path with ENOENT. Anything
+ * `statSync` will not answer — EACCES on a parent, a symlink loop — is
+ * reported as missing, which is what the `existsSync` this replaced said about
+ * those too, and `cwd` will refuse them all the same.
+ */
+function workingDirectoryState(path: string): "usable" | "missing" | "not-a-directory" {
+  try {
+    return statSync(path).isDirectory() ? "usable" : "not-a-directory";
+  } catch {
+    return "missing";
+  }
+}
+
 const verifyApplicationStage: StageDefinition = {
   stage: "verify_application",
   // An inconclusive result is settled, not pending. Re-running a suite that was
@@ -2894,15 +2911,21 @@ const verifyApplicationStage: StageDefinition = {
     // libuv answers a nonexistent `cwd` with ENOENT, the same code as a program
     // that is not on PATH, so without this a renamed or deleted service
     // directory on `--resume` is reported as a missing test runner and the user
-    // is told to install something they already have.
+    // is told to install something they already have. A path that exists but is
+    // not a directory is the same confusion one step on: `spawn` refuses it
+    // with ENOTDIR, a code this run has nothing specific to say about, so the
+    // user is told their command "could not be started (ENOTDIR)" — which names
+    // neither the path at fault nor what is wrong with it.
     const serviceDir = service.path === "." ? ctx.root : join(ctx.root, service.path);
-    if (!existsSync(serviceDir)) {
+    const serviceDirState = workingDirectoryState(serviceDir);
+    if (serviceDirState !== "usable") {
+      const wrong = serviceDirState === "missing" ? "no longer exists" : "is not a directory";
       throw new SetupError({
         stage: "verify_application",
         code: "APP_VERIFICATION_FAILED",
-        message: `\`${command}\` could not be run: ${relative(ctx.root, serviceDir) || "."} no longer exists.`,
+        message: `\`${command}\` could not be run: ${relative(ctx.root, serviceDir) || "."} ${wrong}.`,
         remedy:
-          "Nothing was reverted. The service moved or was deleted since the last run — rerun `traceroot setup` from it to start again.",
+          "Nothing was reverted. The service moved, was deleted or was replaced since the last run — rerun `traceroot setup` from it to start again.",
       });
     }
 

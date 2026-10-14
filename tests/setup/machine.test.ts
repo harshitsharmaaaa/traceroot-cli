@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import { serviceArtifactDir } from "../../src/setup/artifacts.js";
 import { newCheckpoint, readCheckpoint, writeCheckpoint } from "../../src/setup/checkpoint.js";
 import { SETUP_EXIT_CODES } from "../../src/setup/errors.js";
 import { type SetupEvent, jsonEmitter } from "../../src/setup/events.js";
+import type { RunProcessResult } from "../../src/setup/exec.js";
 import type { SetupDeps } from "../../src/setup/machine.js";
 import {
   defaultSetupDeps,
@@ -1810,6 +1812,99 @@ describe("failure handling", () => {
     expect(result.error?.message).toContain("`pytest` is not executable");
     expect(result.error?.message).not.toContain("was not found");
     expect(result.error?.remedy).toContain("Make it executable");
+  });
+
+  /** A repository whose only service is a subdirectory, so it can be replaced. */
+  function subdirRepo(): void {
+    mkdirSync(join(dir, "svc"), { recursive: true });
+    writeFileSync(
+      join(dir, "svc", "pyproject.toml"),
+      '[project]\ndependencies = ["fastapi","pytest"]\n',
+    );
+    writeFileSync(join(dir, "svc", "main.py"), "print('hi')\n");
+  }
+
+  /**
+   * Wraps a runner with libuv's own answers for a `cwd` it cannot use, and
+   * breaks the service directory once the import check has run — the last thing
+   * before the verification, so the verification is what meets it.
+   *
+   * A `--resume` whose service directory went away between runs arrives at the
+   * same place by a longer road, through a checkpoint; this is that moment
+   * inside one run. The fake runner otherwise ignores `cwd` entirely, so
+   * without the refusals below the guard ahead of the spawn would be the only
+   * thing here that looked at the directory at all. Both codes are what a real
+   * `spawn` answers: ENOENT for a missing `cwd`, on the `error` event, and
+   * ENOTDIR for one that is a file, thrown outright.
+   */
+  function losingTheServiceDir(
+    run: SetupDeps["runProcess"],
+    breakIt: () => void,
+  ): SetupDeps["runProcess"] {
+    const refused = (code: string): RunProcessResult => ({
+      exitCode: 127,
+      output: "",
+      durationMs: 1,
+      timedOut: false,
+      spawnFailed: true,
+      spawnErrorCode: code,
+    });
+    return async (o) => {
+      if (!existsSync(o.cwd)) {
+        return refused("ENOENT");
+      }
+      if (!statSync(o.cwd).isDirectory()) {
+        return refused("ENOTDIR");
+      }
+      const result = await run(o);
+      if (o.program === "python3") {
+        breakIt();
+      }
+      return result;
+    };
+  }
+
+  it("blames the service directory that went missing, not the test runner", async () => {
+    // A `cwd` that is not there comes back ENOENT, the same code as a program
+    // that is not on PATH, so this used to tell the user to install `pytest`.
+    subdirRepo();
+    const process = fakeRunProcess({ gitStatus: ["", " M svc/main.py"] });
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: losingTheServiceDir(process.run, () =>
+        rmSync(join(dir, "svc"), { recursive: true, force: true }),
+      ),
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
+    expect(result.error?.message).toContain("svc no longer exists");
+    expect(result.error?.message).not.toContain("was not found");
+  });
+
+  it("says so when the service directory is no longer a directory", async () => {
+    // Existence is not the question `cwd` asks. A path that exists as a file is
+    // refused with ENOTDIR, which has no familiar cause to name, so the user got
+    // the generic wording — the same dead end the check above exists to remove.
+    subdirRepo();
+    const process = fakeRunProcess({ gitStatus: ["", " M svc/main.py"] });
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: losingTheServiceDir(process.run, () => {
+        rmSync(join(dir, "svc"), { recursive: true, force: true });
+        writeFileSync(join(dir, "svc"), "a file where the service used to be\n");
+      }),
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
+    expect(result.error?.message).toContain("svc is not a directory");
+    expect(result.error?.message).not.toContain("ENOTDIR");
+    expect(result.error?.remedy).toContain("rerun");
   });
 
   it("fails when no trace arrives before the timeout", async () => {
