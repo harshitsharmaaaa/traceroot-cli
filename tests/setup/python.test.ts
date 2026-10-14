@@ -69,6 +69,24 @@ describe("finding the Python a service actually runs on", () => {
  * The case-folding branch is Windows-only and CI runs on Linux, so without
  * this the half of the behaviour that exists for Windows is never executed.
  */
+/**
+ * Runs `fn` with the platform reported as POSIX.
+ *
+ * The counterpart to `onWindows`. `withVenvOnPath` branches on the platform, so
+ * a test that asserts the POSIX rule while reading the host's own platform
+ * asserts nothing on a Windows runner — it would take the collapse branch,
+ * delete the other spelling, and fail.
+ */
+function onPosix<T>(fn: () => T): T {
+  const real = process.platform;
+  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+  try {
+    return fn();
+  } finally {
+    Object.defineProperty(process, "platform", { value: real, configurable: true });
+  }
+}
+
 function onWindows<T>(fn: () => T): T {
   const real = process.platform;
   Object.defineProperty(process, "platform", { value: "win32", configurable: true });
@@ -102,9 +120,8 @@ describe("running a project's own commands in its virtualenv", () => {
     // find a program in the directory it names, which is why POSIX lookup is
     // `PATH` or nothing. Deleting the others throws away variables this
     // function was never asked about.
-    const env = withVenvOnPath(
-      { PATH: "/usr/bin", Path: "/opt/vendor/Path" },
-      "/repo/.venv/bin/python",
+    const env = onPosix(() =>
+      withVenvOnPath({ PATH: "/usr/bin", Path: "/opt/vendor/Path" }, "/repo/.venv/bin/python"),
     );
 
     expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
@@ -116,9 +133,8 @@ describe("running a project's own commands in its virtualenv", () => {
     // value puts `Path` ahead of `PATH` here, and the child is left with a
     // search path assembled out of a variable that was never one — the real
     // `/usr/bin` gone, so nothing but the venv resolves.
-    const env = withVenvOnPath(
-      { Path: "/opt/vendor/Path", PATH: "/usr/bin" },
-      "/repo/.venv/bin/python",
+    const env = onPosix(() =>
+      withVenvOnPath({ Path: "/opt/vendor/Path", PATH: "/usr/bin" }, "/repo/.venv/bin/python"),
     );
 
     expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
