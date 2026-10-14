@@ -175,12 +175,14 @@ describe("running the check in the environment the SDK was installed into", () =
         durationMs: 4,
         timedOut: false,
         spawnFailed: true,
+        spawnErrorCode: "ENOENT",
       }),
     });
 
     expect(result.verification.passed).toBe(false);
     expect(result.failure?.spawnFailed).toBe(true);
     expect(result.failure?.program).toBe("pytest");
+    expect(result.failure?.spawnErrorCode).toBe("ENOENT");
   });
 });
 

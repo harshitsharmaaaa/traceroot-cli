@@ -2969,21 +2969,35 @@ const verifyApplicationStage: StageDefinition = {
     }
 
     if (!verification.passed) {
-      const tail = failure === null ? "" : `\n\n${outputTail(failure.output)}`;
-      // A command that is not installed never ran, so it has no output to show
-      // and nothing about the instrumentation to blame. Saying it "failed after
-      // instrumentation" sends the user looking through code that is fine, and
-      // the empty log gives them nothing to go on. Checked first because it is
-      // the most actionable of the four and the only one that names a fix.
-      const missingProgram = failure?.spawnFailed === true ? failure.program : null;
-      // Of the rest, only one is a claim this run can support. "Failed after
-      // instrumentation" was printed whether or not anything had established
-      // that it passed before — which on a suite that was already red sent the
-      // user looking for a fault in work that had just been done correctly.
-      const measuredBefore = verification.baseline?.ran === true;
+      // Only the tail of the failing run's output: enough to see the error,
+      // little enough that a chatty test suite does not bury the remedy.
+      const tail =
+        failure === null ? "" : `\n\n${failure.output.split("\n").slice(-25).join("\n").trim()}`;
+      // A command that is not installed never ran, so it has no output to
+      // show and nothing about the instrumentation to blame. Saying it
+      // "failed after instrumentation" sends the user looking through code
+      // that is fine, and the empty log gives them nothing to go on.
+      // `spawnFailed` is every spawn failure, not just a missing program, so
+      // the code decides the wording: a command that exists but cannot be
+      // executed is a different problem with a different remedy, and telling
+      // that user it "was not found" sends them looking for a file they have.
+      const unstartable = failure?.spawnFailed === true ? failure : null;
+      const reason =
+        unstartable === null
+          ? null
+          : unstartable.spawnErrorCode === "ENOENT"
+            ? `\`${unstartable.program}\` was not found`
+            : unstartable.spawnErrorCode === "EACCES"
+              ? `\`${unstartable.program}\` is not executable`
+              : `\`${unstartable.program}\` could not be started${unstartable.spawnErrorCode === undefined ? "" : ` (${unstartable.spawnErrorCode})`}`;
+        // Of the rest, only one is a claim this run can support. "Failed after
+        // instrumentation" was printed whether or not anything had established
+        // that it passed before — which on a suite that was already red sent the
+        // user looking for a fault in work that had just been done correctly.
+        const measuredBefore = verification.baseline?.ran === true;
       const message =
-        missingProgram !== null
-          ? `\`${command}\` could not be run: \`${missingProgram}\` was not found.`
+        reason !== null
+          ? `\`${command}\` could not be run: ${reason}.`
           : failure?.phase === "without"
             ? `\`${command}\` passed with TraceRoot configured but failed with ${KEY_ENV} removed. The application must keep working when TraceRoot is absent.${tail}`
             : measuredBefore
@@ -2998,12 +3012,14 @@ const verifyApplicationStage: StageDefinition = {
         code: "APP_VERIFICATION_FAILED",
         message,
         remedy:
-          missingProgram !== null
-            ? [
-                "Nothing was reverted. Install it, or run setup from the environment that has it,",
+          reason === null
+            ? "Nothing was reverted. Fix the failure, then rerun `traceroot setup --resume` to finish verification."
+            : [
+                unstartable?.spawnErrorCode === "ENOENT"
+                  ? "Nothing was reverted. Install it, or run setup from the environment that has it,"
+                  : "Nothing was reverted. Make it runnable from this directory,",
                 "then rerun `traceroot setup --resume` to finish verification.",
-              ].join("\n")
-            : "Nothing was reverted. Fix the failure, then rerun `traceroot setup --resume` to finish verification.",
+              ].join("\n"),
       });
     }
 

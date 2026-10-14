@@ -1758,7 +1758,14 @@ describe("failure handling", () => {
     const process = fakeRunProcess({ gitStatus: ["", " M main.py"] });
     const wrapped: SetupDeps["runProcess"] = async (o) =>
       o.program === "pytest"
-        ? { exitCode: 127, output: "", durationMs: 4, timedOut: false, spawnFailed: true }
+        ? {
+            exitCode: 127,
+            output: "",
+            durationMs: 4,
+            timedOut: false,
+            spawnFailed: true,
+            spawnErrorCode: "ENOENT",
+          }
         : process.run(o);
     const deps = makeDeps({
       auth: authWithKey(),
@@ -1773,6 +1780,36 @@ describe("failure handling", () => {
     expect(result.error?.message).toContain("`pytest` was not found");
     expect(result.error?.message).not.toContain("failed after instrumentation");
     expect(result.error?.remedy).toContain("Install it");
+  });
+
+  it("does not call a command that exists but cannot be executed 'not found'", async () => {
+    // `spawnFailed` is set for every spawn failure, not only ENOENT, so reading
+    // it alone sent the user looking for a file they already have.
+    pythonRepo();
+    const process = fakeRunProcess({ gitStatus: ["", " M main.py"] });
+    const wrapped: SetupDeps["runProcess"] = async (o) =>
+      o.program === "pytest"
+        ? {
+            exitCode: 127,
+            output: "",
+            durationMs: 3,
+            timedOut: false,
+            spawnFailed: true,
+            spawnErrorCode: "EACCES",
+          }
+        : process.run(o);
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: wrapped,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
+    expect(result.error?.message).toContain("`pytest` is not executable");
+    expect(result.error?.message).not.toContain("was not found");
+    expect(result.error?.remedy).toContain("Make it runnable");
   });
 
   it("fails when no trace arrives before the timeout", async () => {

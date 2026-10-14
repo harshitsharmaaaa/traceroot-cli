@@ -127,12 +127,36 @@ export interface RunProcessResult {
   output: string;
   durationMs: number;
   timedOut: boolean;
-  /** True when the program could not be spawned at all (ENOENT). */
+  /**
+   * True when the program could not be started at all — the `spawn` call threw,
+   * or the child emitted `error` before running. Set for **every** spawn
+   * failure, not only a missing program: `EACCES` on a file that exists but is
+   * not executable lands here too, which is why {@link spawnErrorCode} carries
+   * the reason rather than letting callers assume one.
+   */
   spawnFailed: boolean;
+  /**
+   * The libuv error code behind a spawn failure — `ENOENT` for a program that
+   * is not on `PATH`, `EACCES` for one that cannot be executed, and so on.
+   * Undefined when the child started, and when the failure carried no code.
+   */
+  spawnErrorCode?: string;
 }
 
 /** Injectable process runner, so every stage that shells out stays testable. */
 export type RunProcess = (options: RunProcessOptions) => Promise<RunProcessResult>;
+
+/**
+ * The libuv code off a spawn error, when it carries one.
+ *
+ * Node puts it on `error.code` as a string. Anything without one is a failure
+ * this module has nothing specific to say about, and callers render it as such
+ * rather than guessing at the most likely cause.
+ */
+function errorCode(err: unknown): string | undefined {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : undefined;
+}
 
 /** The conventional 128+n for a signalled exit, which has a null code. */
 function statusFor(code: number | null, signalName: NodeJS.Signals | null): number {
@@ -185,13 +209,14 @@ export const runProcess: RunProcess = (options) =>
           ? [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"]
           : [options.stdin === undefined ? "inherit" : "pipe", "inherit", "inherit"],
       });
-    } catch {
+    } catch (err) {
       return resolve({
         exitCode: 127,
         output: "",
         durationMs: Date.now() - started,
         timedOut: false,
         spawnFailed: true,
+        spawnErrorCode: errorCode(err),
       });
     }
 
@@ -206,7 +231,7 @@ export const runProcess: RunProcess = (options) =>
     let drainTimer: NodeJS.Timeout | undefined;
     let escalation: NodeJS.Timeout | undefined;
 
-    const finish = (exitCode: number, spawnFailed = false): void => {
+    const finish = (exitCode: number, spawnFailed = false, spawnErrorCode?: string): void => {
       if (settled) {
         return;
       }
@@ -249,6 +274,7 @@ export const runProcess: RunProcess = (options) =>
         durationMs: Date.now() - started,
         timedOut,
         spawnFailed,
+        spawnErrorCode,
       });
     };
 
@@ -369,7 +395,7 @@ export const runProcess: RunProcess = (options) =>
       child.stdin?.end(options.stdin);
     }
 
-    child.on("error", () => finish(127, true));
+    child.on("error", (err) => finish(127, true, errorCode(err)));
     child.on("exit", (code, signalName) => {
       exited = true;
       const status = statusFor(code, signalName);

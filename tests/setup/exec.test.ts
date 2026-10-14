@@ -365,6 +365,39 @@ describe("a survivor that ignored SIGTERM", () => {
     },
     19000,
   );
+describe("why a program could not be started", () => {
+  it("reports ENOENT for a program that is not on PATH", async () => {
+    // The flag alone cannot distinguish this from a program that exists and
+    // cannot be executed, and the two need different remedies.
+    const result = await runProcess({
+      program: "traceroot-no-such-program-xyz",
+      args: [],
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: "capture",
+    });
+
+    expect(result.spawnFailed).toBe(true);
+    expect(result.spawnErrorCode).toBe("ENOENT");
+    expect(result.exitCode).toBe(127);
+  });
+
+  it("reports EACCES for a file that exists but is not executable", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tr-exec-"));
+    const target = join(dir, "not-executable");
+    await writeFile(target, "#!/bin/sh\necho hi\n", { mode: 0o644 });
+
+    const result = await runProcess({
+      program: target,
+      args: [],
+      cwd: dir,
+      env: process.env,
+      stdio: "capture",
+    });
+
+    expect(result.spawnFailed).toBe(true);
+    expect(result.spawnErrorCode).toBe("EACCES");
+  });
 });
 
 describe("a cancelled run whose binary is missing", () => {
