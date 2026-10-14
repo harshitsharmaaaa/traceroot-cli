@@ -1749,6 +1749,32 @@ describe("failure handling", () => {
     expect(result.error?.message).toContain("KeyError");
   });
 
+  it("says the check could not be run when the command is not installed", async () => {
+    // The real run this came from: `pytest` lives in the project's virtualenv,
+    // the spawn failed with ENOENT, and the user was told their suite "failed
+    // after instrumentation" under an empty log — so they went looking through
+    // instrumentation that was fine.
+    pythonRepo();
+    const process = fakeRunProcess({ gitStatus: ["", " M main.py"] });
+    const wrapped: SetupDeps["runProcess"] = async (o) =>
+      o.program === "pytest"
+        ? { exitCode: 127, output: "", durationMs: 4, timedOut: false, spawnFailed: true }
+        : process.run(o);
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: wrapped,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
+    expect(result.error?.message).toContain("could not be run");
+    expect(result.error?.message).toContain("`pytest` was not found");
+    expect(result.error?.message).not.toContain("failed after instrumentation");
+    expect(result.error?.remedy).toContain("Install it");
+  });
+
   it("fails when no trace arrives before the timeout", async () => {
     pythonRepo();
     const deps = makeDeps({

@@ -98,7 +98,17 @@ export interface VerifyApplicationInput {
  */
 export interface VerifyApplicationResult {
   verification: ApplicationVerification;
-  failure: { phase: "with" | "without"; output: string } | null;
+  failure: {
+    phase: "with" | "without";
+    output: string;
+    /**
+     * The program as spawned, and whether it could be spawned at all. A
+     * command that is not installed produces no output to report, so without
+     * these the caller can only say that it failed and show an empty log.
+     */
+    program: string;
+    spawnFailed: boolean;
+  } | null;
   /**
    * Files the credential was taken out of for the credential-free run, so what
    * "without the credential" meant is a fact the caller can report rather than
@@ -397,7 +407,14 @@ export async function verifyApplication(
       // project's own business rather than something setup puts in front of the
       // user. An unmeasured one has explained nothing, so the caller is handed
       // the output to show — it is the only diagnostic that run has.
-      failure: alreadyBroken ? null : { phase: "with", output: first.output },
+      failure: alreadyBroken
+        ? null
+        : {
+            phase: "with",
+            output: first.output,
+            program: parsed.program,
+            spawnFailed: first.spawnFailed,
+          },
       withheld: [],
       ranAt,
     };
@@ -432,7 +449,14 @@ export async function verifyApplication(
       passed,
       skippedReason: null,
     },
-    failure: passed ? null : { phase: "without", output: second.result.output },
+    failure: passed
+      ? null
+      : {
+          phase: "without",
+          output: second.result.output,
+          program: parsed.program,
+          spawnFailed: second.result.spawnFailed,
+        },
     withheld: second.withheld,
     ranAt,
   };

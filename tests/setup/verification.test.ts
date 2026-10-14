@@ -133,6 +133,57 @@ describe("running the project's own check twice", () => {
   });
 });
 
+describe("running the check in the environment the SDK was installed into", () => {
+  it("puts the virtualenv's scripts on PATH for both runs", async () => {
+    // `detect_stack` names the project's own check as the project documents it
+    // — `pytest`, not `.venv/bin/pytest`. That command exists only inside the
+    // virtualenv, so without this the spawn fails with ENOENT and the run
+    // reports a suite that broke after instrumentation without running one.
+    const { run, runs } = fakeRunProcess();
+    await verifyApplication({
+      command: "pytest",
+      cwd: "/repo",
+      parentEnv: { PATH: "/usr/bin" },
+      credential: makeSecret(KEY),
+      host: "https://api.example.test",
+      credentialFiles: [],
+      interpreter: "/repo/.venv/bin/python",
+      runProcess: run,
+    });
+
+    expect(runs).toHaveLength(2);
+    for (const recorded of runs) {
+      expect(recorded.env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
+    }
+  });
+
+  it("says a command could not be spawned, rather than reporting an empty failure", async () => {
+    // A command that is not installed produces no output at all, so a caller
+    // that only knows "it failed" shows the user an empty log and sends them
+    // looking through instrumentation that is fine.
+    const result = await verifyApplication({
+      command: "pytest",
+      cwd: "/repo",
+      parentEnv: {},
+      credential: makeSecret(KEY),
+      host: "https://api.example.test",
+      credentialFiles: [],
+      interpreter: null,
+      runProcess: async () => ({
+        exitCode: 127,
+        output: "",
+        durationMs: 4,
+        timedOut: false,
+        spawnFailed: true,
+      }),
+    });
+
+    expect(result.verification.passed).toBe(false);
+    expect(result.failure?.spawnFailed).toBe(true);
+    expect(result.failure?.program).toBe("pytest");
+  });
+});
+
 describe("proving the application runs without the credential", () => {
   /**
    * An application whose instrumentation hard-fails unless a key is reachable —

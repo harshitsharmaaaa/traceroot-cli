@@ -2970,17 +2970,25 @@ const verifyApplicationStage: StageDefinition = {
 
     if (!verification.passed) {
       const tail = failure === null ? "" : `\n\n${outputTail(failure.output)}`;
-      // Only one of these three is a claim this run can support. "Failed after
+      // A command that is not installed never ran, so it has no output to show
+      // and nothing about the instrumentation to blame. Saying it "failed after
+      // instrumentation" sends the user looking through code that is fine, and
+      // the empty log gives them nothing to go on. Checked first because it is
+      // the most actionable of the four and the only one that names a fix.
+      const missingProgram = failure?.spawnFailed === true ? failure.program : null;
+      // Of the rest, only one is a claim this run can support. "Failed after
       // instrumentation" was printed whether or not anything had established
       // that it passed before — which on a suite that was already red sent the
       // user looking for a fault in work that had just been done correctly.
       const measuredBefore = verification.baseline?.ran === true;
       const message =
-        failure?.phase === "without"
-          ? `\`${command}\` passed with TraceRoot configured but failed with ${KEY_ENV} removed. The application must keep working when TraceRoot is absent.${tail}`
-          : measuredBefore
-            ? `\`${command}\` passed before this run instrumented anything, and fails now.${tail}`
-            : `\`${command}\` failed. Setup did not run it beforehand, so whether the instrumentation caused this is not established.${tail}`;
+        missingProgram !== null
+          ? `\`${command}\` could not be run: \`${missingProgram}\` was not found.`
+          : failure?.phase === "without"
+            ? `\`${command}\` passed with TraceRoot configured but failed with ${KEY_ENV} removed. The application must keep working when TraceRoot is absent.${tail}`
+            : measuredBefore
+              ? `\`${command}\` passed before this run instrumented anything, and fails now.${tail}`
+              : `\`${command}\` failed. Setup did not run it beforehand, so whether the instrumentation caused this is not established.${tail}`;
       // Paused, which is what this remedy has always promised and what the
       // rollback used to contradict: the run revoked the key and took the
       // credential back out of the env file, and then told the user to resume
@@ -2990,7 +2998,12 @@ const verifyApplicationStage: StageDefinition = {
         code: "APP_VERIFICATION_FAILED",
         message,
         remedy:
-          "Nothing was reverted. Fix the failure, then rerun `traceroot setup --resume` to finish verification.",
+          missingProgram !== null
+            ? [
+                "Nothing was reverted. Install it, or run setup from the environment that has it,",
+                "then rerun `traceroot setup --resume` to finish verification.",
+              ].join("\n")
+            : "Nothing was reverted. Fix the failure, then rerun `traceroot setup --resume` to finish verification.",
       });
     }
 
