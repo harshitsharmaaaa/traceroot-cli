@@ -313,9 +313,32 @@ function skillsRepo(skills: { name: string; bundled: boolean }[], origin?: strin
 const headOf = (repo: string) =>
   spawnSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
 
-/** Makes the repo's HEAD look fetched, which is what silences the push warning. */
-const publish = (repo: string) =>
+/**
+ * Makes the repo's HEAD look landed on origin's default branch, which is what
+ * silences the warning. `git clone` writes `origin/HEAD` and `update-ref`
+ * does not, so a sandbox has to set it explicitly or the check has no default
+ * branch to measure reachability against.
+ */
+const publish = (repo: string) => {
   spawnSync("git", ["-C", repo, "update-ref", "refs/remotes/origin/main", headOf(repo)]);
+  spawnSync("git", [
+    "-C",
+    repo,
+    "symbolic-ref",
+    "refs/remotes/origin/HEAD",
+    "refs/remotes/origin/main",
+  ]);
+};
+
+/**
+ * Adds a commit on top of HEAD, so origin's default branch stops short of it
+ * — what a commit living only on an open pull request's branch looks like.
+ */
+const commitOnTop = (repo: string) => {
+  write(join(repo, "skills", "skill-one", "references", "extra.md"), "extra\n");
+  spawnSync("git", ["-C", repo, "add", "-A"]);
+  spawnSync("git", ["-C", repo, "commit", "-q", "-m", "more skills"]);
+};
 
 describe("refresh-skills.mjs", () => {
   it("vendors only the bundled skills and filters the manifest to match", () => {
@@ -414,16 +437,31 @@ describe("refresh-skills.mjs", () => {
     expect(readdirSync(join(root, "assets"))).toEqual(["skills"]);
   });
 
-  it("warns when the recorded commit is on no remote-tracking branch", () => {
+  it("warns when the recorded commit has not landed on origin's default branch", () => {
     const root = sandbox();
-    // No `publish(repo)`, so nothing has been fetched from a remote: the commit
-    // resolves here and would verify forever while naming bytes nobody can
-    // look up.
+    const repo = skillsRepo([{ name: "skill-one", bundled: true }]);
+    // The commit resolves here and would verify forever, while the branch
+    // carrying it disappears the moment its pull request is squash-merged —
+    // leaving `skills:check` measuring the copy against a commit nobody can
+    // fetch.
+    publish(repo);
+    commitOnTop(repo);
+    const result = refresh(root, [repo]);
+    expect(result.status).toBe(0);
+    expect(plain(result.stderr)).toContain("has not landed on origin/main");
+    expect(plain(result.stderr)).toContain("Record a commit that is on origin/main");
+  });
+
+  it("warns that it could not check landing when the clone has no origin/HEAD", () => {
+    const root = sandbox();
+    // `origin/HEAD` is written by `git clone` and left stale by a default-branch
+    // rename, so its absence is reported as an unchecked pin rather than as
+    // evidence either way about the commit.
     const repo = skillsRepo([{ name: "skill-one", bundled: true }]);
     const result = refresh(root, [repo]);
     expect(result.status).toBe(0);
-    expect(plain(result.stderr)).toContain("is not on any remote-tracking branch");
-    expect(plain(result.stderr)).toContain("Push it before this record is relied on");
+    expect(plain(result.stderr)).toContain("has no origin/HEAD");
+    expect(plain(result.stderr)).toContain("remote set-head origin -a");
   });
 
   it("records owner/repo from an scp-style origin URL", () => {
