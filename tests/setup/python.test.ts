@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { detectPythonEnvironment } from "../../src/setup/python.js";
+import { detectPythonEnvironment, withVenvOnPath } from "../../src/setup/python.js";
 
 let dir: string;
 
@@ -60,5 +60,38 @@ describe("finding the Python a service actually runs on", () => {
     // Null is a real answer: the task tells the agent to create a venv rather
     // than to force past PEP 668.
     expect(detectPythonEnvironment(dir, ".", {}).interpreter).toBeNull();
+  });
+});
+
+describe("running a project's own commands in its virtualenv", () => {
+  it("puts the interpreter's directory first, so a venv script wins over a global one", () => {
+    // The failure this prevents: `detect_stack` names `pytest`, which exists
+    // only inside the virtualenv, and the spawn fails with ENOENT before a
+    // single test has run.
+    const env = withVenvOnPath({ PATH: "/usr/bin" }, "/repo/.venv/bin/python");
+
+    expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
+  });
+
+  it("leaves the environment alone when there is no virtualenv", () => {
+    // A service that is not Python, or one run on a system interpreter: there
+    // is nothing to add and PATH must not be rewritten for it.
+    const parent = { PATH: "/usr/bin" };
+
+    expect(withVenvOnPath(parent, null)).toBe(parent);
+  });
+
+  it("reuses the inherited key's own spelling", () => {
+    // A spread copy of `process.env` is a plain object with no case folding, so
+    // writing `PATH` beside an inherited `Path` would leave the child holding
+    // both with no say in which one wins.
+    const env = withVenvOnPath({ Path: "C:\\Windows" }, "/repo/.venv/bin/python");
+
+    expect(env.Path).toBe(`/repo/.venv/bin${delimiter}C:\\Windows`);
+    expect("PATH" in env).toBe(false);
+  });
+
+  it("stands on its own when the parent has no PATH at all", () => {
+    expect(withVenvOnPath({}, "/repo/.venv/bin/python").PATH).toBe("/repo/.venv/bin");
   });
 });
