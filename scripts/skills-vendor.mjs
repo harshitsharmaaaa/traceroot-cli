@@ -32,6 +32,59 @@ export const MANIFEST = "manifest.json";
 /** A skill name is interpolated into a path, so only a plain directory name is allowed. */
 export const SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
+/**
+ * The one remote assets/skills/ may be vendored from, as the two things a git
+ * remote URL carries: the host that serves the bytes and the `owner/repo` the
+ * provenance record names. Both have to be checked, because the record only
+ * ever states the second one — a clone of a repository with the same
+ * `owner/repo` on a different host produces a record that is true about the
+ * slug and false about where the bytes came from.
+ */
+export const SKILLS_REMOTE = { host: "github.com", repository: "traceroot-ai/traceroot-skills" };
+
+/**
+ * `{ host, repository }` for a git remote URL, or null when it is neither form
+ * git hands out. The host is lowercased because DNS names are case-insensitive;
+ * the repository is left exactly as written, so what gets recorded is what the
+ * remote says.
+ *
+ * Both forms are parsed the way git and curl resolve them, so that what this
+ * reports is the host a fetch would actually talk to:
+ *
+ *   - `scheme://[userinfo@]host[:port]/owner/repo(.git)` — the userinfo runs to
+ *     the *last* `@` in the authority, so `https://github.com@evil.test/o/r`
+ *     reads as host `evil.test`, which is where it would really go.
+ *   - `[user@]host:owner/repo(.git)` — scp-like, recognised only when no slash
+ *     precedes the colon, which is git's own rule for telling it from a URL.
+ *
+ * A `scheme://` URL is never retried as scp-like, which is also git's rule, so
+ * one whose authority cannot be read — `file:///path`, an IPv6 literal — is
+ * refused instead of being re-read as a host named after its scheme.
+ */
+export function parseGitRemote(url) {
+  const trimmed = url.trim();
+  const match = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+    ? /^[a-z][a-z0-9+.-]*:\/\/(?:[^/]*@)?([^/:@]+)(?::\d+)?\/(.+)$/i.exec(trimmed)
+    : /^(?:[^@/]+@)?([^@/:]+):(.+)$/.exec(trimmed);
+  if (match === null) {
+    return null;
+  }
+  const [, host, path] = match;
+  if (host === undefined || path === undefined) {
+    return null;
+  }
+  // `owner/repo.git/`, `owner/repo/` and `owner/repo` all name the same
+  // repository: trailing slashes first, then the suffix they may have hidden.
+  const repository = path
+    .replace(/\/+$/, "")
+    .replace(/\.git$/, "")
+    .replace(/^\/+/, "");
+  if (repository === "") {
+    return null;
+  }
+  return { host: host.toLowerCase(), repository };
+}
+
 /** Writes `message` as an `error:` line and exits 1 — the convention both scripts share. */
 export function fail(message) {
   process.stderr.write(`error: ${message}\n`);

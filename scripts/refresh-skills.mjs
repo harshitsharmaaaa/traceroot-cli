@@ -3,10 +3,12 @@ import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:f
 import { dirname, join } from "node:path";
 import {
   MANIFEST,
+  SKILLS_REMOTE,
   SKILL_NAME,
   SOURCE,
   assetsSkillsDir,
   fail,
+  parseGitRemote,
   renderSource,
   sha256,
 } from "./skills-vendor.mjs";
@@ -122,33 +124,42 @@ if (originHead.status !== 0 || originHead.stdout.trim() === "") {
   }
 }
 
-/** `owner/repo` for the clone's `origin`, which is where the vendored bytes came from. */
-function repositorySlug() {
+// The record names the repository the bytes came from, and nothing downstream
+// checks the value — the provenance check only requires it to be a non-empty
+// string — so a refresh run against any other clone would record
+// `traceroot-ai/traceroot-skills` for bytes that did not come from it and pass
+// CI, pinning a commit the skills repository does not have.
+//
+// `owner/repo` alone does not identify a repository: every host has its own
+// `traceroot-ai/traceroot-skills` for the asking, so the slug has to be checked
+// together with the host that served it. Both come from `parseGitRemote`, which
+// resolves the authority the way a fetch would rather than trusting the shape
+// of the URL.
+/** `owner/repo` for the clone's `origin`, refusing any origin but the canonical one. */
+function canonicalRepository() {
   const url = text(
     ["remote", "get-url", "origin"],
     `${cloneArg} has no \`origin\` remote, so there is no repository to record.`,
   );
-  // Both forms git hands out: scp-like `git@host:owner/repo.git` and a URL
-  // whose path ends in `owner/repo(.git)`.
-  const match = /^(?:[^@]+@[^:]+:|[a-z+]+:\/\/[^/]+\/)(.+?)(?:\.git)?\/?$/.exec(url);
-  if (match === null) {
-    fail(`cannot read an owner/repo out of the \`origin\` URL ${JSON.stringify(url)}.`);
+  const expected = `${SKILLS_REMOTE.host}/${SKILLS_REMOTE.repository}`;
+  const remote = parseGitRemote(url);
+  if (remote === null) {
+    fail(
+      `cannot read a host and owner/repo out of the \`origin\` URL ${JSON.stringify(url)}, which has to be ${expected} — set the clone's \`origin\` to https://${expected}.git or git@${SKILLS_REMOTE.host}:${SKILLS_REMOTE.repository}.git, or pass a canonical clone.`,
+    );
   }
-  return match[1];
+  if (
+    remote.host !== SKILLS_REMOTE.host ||
+    remote.repository.toLowerCase() !== SKILLS_REMOTE.repository
+  ) {
+    fail(
+      `${cloneArg}'s \`origin\` is ${remote.host}/${remote.repository}, not ${expected} — vendoring from anywhere else records a commit the skills repository cannot serve, under a name that claims it can. Point the clone's \`origin\` at ${expected}, or pass a canonical clone.`,
+    );
+  }
+  return remote.repository;
 }
 
-const repository = repositorySlug();
-
-// The record names the repository the bytes came from, and nothing downstream
-// checks the value — the provenance check only requires it to be a non-empty
-// string — so a refresh run in a fork's clone would record the fork and pass
-// CI, pinning a commit the skills repository does not have.
-const EXPECTED_REPOSITORY = "traceroot-ai/traceroot-skills";
-if (repository.toLowerCase() !== EXPECTED_REPOSITORY) {
-  fail(
-    `${cloneArg}'s \`origin\` is ${repository}, not ${EXPECTED_REPOSITORY} — vendoring from a fork records a commit the skills repository cannot serve. Point the clone's \`origin\` at ${EXPECTED_REPOSITORY}, or pass a canonical clone.`,
-  );
-}
+const repository = canonicalRepository();
 
 /** One blob at `commit`, as bytes. */
 const blob = (path) =>
