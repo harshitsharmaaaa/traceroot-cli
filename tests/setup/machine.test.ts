@@ -1809,7 +1809,7 @@ describe("failure handling", () => {
     expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
     expect(result.error?.message).toContain("`pytest` is not executable");
     expect(result.error?.message).not.toContain("was not found");
-    expect(result.error?.remedy).toContain("Make it runnable");
+    expect(result.error?.remedy).toContain("Make it executable");
   });
 
   it("fails when no trace arrives before the timeout", async () => {
@@ -2470,6 +2470,33 @@ describe("proving the agent installed the SDK", () => {
 
     expect(result.error).toBeNull();
     expect(importChecks(inner.runs).map((run) => run.program)).toEqual([venvPython]);
+  });
+
+  it("verifies a Poetry project through Poetry, not a bare pytest", async () => {
+    // Poetry's default environment is a hashed directory under its own cache,
+    // which `detectPythonEnvironment` does not look at — so putting a
+    // virtualenv on PATH cannot help here and a bare `pytest` fails to spawn.
+    // Reported naively that reads as "pytest was not found. Install it", about
+    // a pytest that is installed.
+    pythonRepo();
+    writeFileSync(join(dir, "poetry.lock"), "");
+    initGit();
+    const inner = fakeRunProcess({ gitStatus: ["", " M main.py"] });
+    const seen: string[] = [];
+    const runProcess: SetupDeps["runProcess"] = async (o) => {
+      seen.push([o.program, ...o.args].join(" "));
+      return inner.run(o);
+    };
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    await runSetupMachine(ctx, deps);
+
+    expect(seen).toContain("poetry run pytest");
+    expect(seen).not.toContain("pytest");
   });
 
   it("asks Poetry for its own environment instead of probing the system python", async () => {

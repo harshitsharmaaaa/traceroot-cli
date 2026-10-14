@@ -2891,6 +2891,21 @@ const verifyApplicationStage: StageDefinition = {
       return "skipped";
     }
 
+    // libuv answers a nonexistent `cwd` with ENOENT, the same code as a program
+    // that is not on PATH, so without this a renamed or deleted service
+    // directory on `--resume` is reported as a missing test runner and the user
+    // is told to install something they already have.
+    const serviceDir = service.path === "." ? ctx.root : join(ctx.root, service.path);
+    if (!existsSync(serviceDir)) {
+      throw new SetupError({
+        stage: "verify_application",
+        code: "APP_VERIFICATION_FAILED",
+        message: `\`${command}\` could not be run: ${relative(ctx.root, serviceDir) || "."} no longer exists.`,
+        remedy:
+          "Nothing was reverted. The service moved or was deleted since the last run — rerun `traceroot setup` from it to start again.",
+      });
+    }
+
     wizardProgress(ctx, `Verifying the application: ${command}`);
     const { verification, failure, ranAt } = await verifyApplication({
       command,
@@ -3017,7 +3032,11 @@ const verifyApplicationStage: StageDefinition = {
             : [
                 unstartable?.spawnErrorCode === "ENOENT"
                   ? "Nothing was reverted. Install it, or run setup from the environment that has it,"
-                  : "Nothing was reverted. Make it runnable from this directory,",
+                  : unstartable?.spawnErrorCode === "EACCES"
+                    ? "Nothing was reverted. Make it executable,"
+                    : // ENOTDIR, E2BIG, EPERM and the rest: naming a remedy for
+                      // a cause this has not identified would be guessing.
+                      "Nothing was reverted. Fix the cause,",
                 "then rerun `traceroot setup --resume` to finish verification.",
               ].join("\n"),
       });

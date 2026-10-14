@@ -81,14 +81,33 @@ describe("running a project's own commands in its virtualenv", () => {
     expect(withVenvOnPath(parent, null)).toBe(parent);
   });
 
-  it("reuses the inherited key's own spelling", () => {
-    // A spread copy of `process.env` is a plain object with no case folding, so
-    // writing `PATH` beside an inherited `Path` would leave the child holding
-    // both with no say in which one wins.
+  it("collapses every spelling of PATH into one key", () => {
+    // A spread copy of process.env is a plain object with no case folding, so a
+    // Windows child could be handed both `Path` and `PATH`. Which one wins is
+    // the host's business; writing one and leaving the other is a bet on that
+    // answer, and losing it means the virtualenv never reaches the child —
+    // exactly the ENOENT this function exists to prevent. One key, no bet.
     const env = withVenvOnPath({ Path: "C:\\Windows" }, "/repo/.venv/bin/python");
 
-    expect(env.Path).toBe(`/repo/.venv/bin${delimiter}C:\\Windows`);
-    expect("PATH" in env).toBe(false);
+    expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}C:\\Windows`);
+    expect("Path" in env).toBe(false);
+  });
+
+  it("keeps the inherited value when two spellings disagree", () => {
+    const env = withVenvOnPath({ PATH: "/usr/bin", Path: "" }, "/repo/.venv/bin/python");
+
+    expect(env.PATH).toBe(`/repo/.venv/bin${delimiter}/usr/bin`);
+    expect(Object.keys(env).filter((k) => k.toUpperCase() === "PATH")).toEqual(["PATH"]);
+  });
+
+  it("ignores an interpreter that is not an absolute path", () => {
+    // `dirname("python3")` is ".", and prepending that puts the service
+    // directory first on the child's PATH, where a repository file named
+    // `pytest` would run in preference to the real one.
+    const parent = { PATH: "/usr/bin" };
+
+    expect(withVenvOnPath(parent, "python3")).toBe(parent);
+    expect(withVenvOnPath(parent, "./.venv/bin/python")).toBe(parent);
   });
 
   it("stands on its own when the parent has no PATH at all", () => {

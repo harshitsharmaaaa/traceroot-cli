@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -382,21 +382,28 @@ describe("why a program could not be started", () => {
     expect(result.exitCode).toBe(127);
   });
 
-  it("reports EACCES for a file that exists but is not executable", async () => {
+  // Skipped on Windows, which has no execute bit: libuv resolves only
+  // PATHEXT-style executables there, so this file yields ENOENT rather than
+  // EACCES and the test would be asserting a different platform's behaviour.
+  it.skipIf(WINDOWS)("reports EACCES for a file that exists but is not executable", async () => {
     const dir = await mkdtemp(join(tmpdir(), "tr-exec-"));
-    const target = join(dir, "not-executable");
-    await writeFile(target, "#!/bin/sh\necho hi\n", { mode: 0o644 });
+    try {
+      const target = join(dir, "not-executable");
+      await writeFile(target, "#!/bin/sh\necho hi\n", { mode: 0o644 });
 
-    const result = await runProcess({
-      program: target,
-      args: [],
-      cwd: dir,
-      env: process.env,
-      stdio: "capture",
-    });
+      const result = await runProcess({
+        program: target,
+        args: [],
+        cwd: dir,
+        env: process.env,
+        stdio: "capture",
+      });
 
-    expect(result.spawnFailed).toBe(true);
-    expect(result.spawnErrorCode).toBe("EACCES");
+      expect(result.spawnFailed).toBe(true);
+      expect(result.spawnErrorCode).toBe("EACCES");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

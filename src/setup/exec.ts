@@ -136,9 +136,15 @@ export interface RunProcessResult {
    */
   spawnFailed: boolean;
   /**
-   * The libuv error code behind a spawn failure — `ENOENT` for a program that
-   * is not on `PATH`, `EACCES` for one that cannot be executed, and so on.
-   * Undefined when the child started, and when the failure carried no code.
+   * The error code behind a spawn failure — usually libuv's (`ENOENT` for a
+   * program that is not on `PATH`, `EACCES` for one that cannot be executed),
+   * but a synchronous `spawn` throw can carry a Node-internal one instead,
+   * such as `ERR_INVALID_ARG_VALUE` for a NUL byte in an argument. Undefined
+   * when the child started, and when the failure carried no code.
+   *
+   * A caller rendering this to a user should name the causes it knows and say
+   * only that it could not start the program for the rest, rather than mapping
+   * an unfamiliar code onto the nearest familiar remedy.
    */
   spawnErrorCode?: string;
 }
@@ -147,11 +153,12 @@ export interface RunProcessResult {
 export type RunProcess = (options: RunProcessOptions) => Promise<RunProcessResult>;
 
 /**
- * The libuv code off a spawn error, when it carries one.
+ * The code off a spawn error, when it carries one.
  *
- * Node puts it on `error.code` as a string. Anything without one is a failure
- * this module has nothing specific to say about, and callers render it as such
- * rather than guessing at the most likely cause.
+ * Node puts it on `error.code` as a string — libuv's for a failure to exec,
+ * its own `ERR_*` for an argument it rejected before trying. Anything without
+ * one is a failure this module has nothing specific to say about, and callers
+ * render it as such rather than guessing at the most likely cause.
  */
 function errorCode(err: unknown): string | undefined {
   const code = (err as { code?: unknown } | null)?.code;
