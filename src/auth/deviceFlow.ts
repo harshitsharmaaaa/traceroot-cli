@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { normalizeBaseUrl } from "../api/client.js";
-import { CliError, ExitCode, type Writers, logInfo } from "../output.js";
+import { CliError, ExitCode, type Writers, logInfo, logWarn } from "../output.js";
 import { getVersion } from "../version.js";
 
 /** The allowlisted OAuth client id for this CLI (server-side allowlist). */
@@ -50,8 +50,9 @@ export interface DeviceFlowDeps {
   /** Injectable for tests; defaults to `Date.now`. */
   now?: () => number;
   /**
-   * Opens `url` in a browser; resolving `false` or rejecting means it couldn't.
-   * Always non-fatal — the URL is printed regardless (SSH sessions).
+   * Opens `url` in a browser; resolving `false` or rejecting means it couldn't,
+   * which the flow says out loud. Always non-fatal — the URL is printed
+   * regardless (SSH sessions).
    */
   openBrowser?: (url: string) => Promise<boolean>;
   /** Environment for CI detection; defaults to `process.env`. */
@@ -214,10 +215,17 @@ export async function runDeviceFlow(deps: DeviceFlowDeps): Promise<DeviceFlowRes
   }
   logInfo(`Confirm this code in your browser: ${userCode}`, writers);
   logInfo(`Open ${verifyUrl}`, writers);
+  let opened = false;
   try {
-    await openBrowser(verifyUrl);
+    opened = await openBrowser(verifyUrl);
   } catch {
     // Non-fatal: the URL is already printed.
+  }
+  if (!opened) {
+    // Nothing is about to appear on screen, so do not leave the user waiting on
+    // a browser window that is not coming. The printed URL above is the whole
+    // fallback: the flow still completes by copy-paste.
+    logWarn("could not open a browser — open the URL above to approve this login", writers);
   }
   logInfo("Waiting for approval…", writers);
 

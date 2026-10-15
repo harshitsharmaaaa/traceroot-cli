@@ -176,6 +176,42 @@ describe("runDeviceFlow", () => {
     const result = await h.run();
     expect(result.sessionToken).toBe("sess-1");
     expect(h.err.data).toContain("https://ui/device?user_code=ABCD-EFGH");
+    expect(h.err.data).toContain("could not open a browser");
+  });
+
+  it("says the browser did not open, and leaves the URL to copy", async () => {
+    const h = harness({
+      responder: (call, polls) => {
+        if (call.url.endsWith("/api/auth/device/code")) {
+          return jsonResponse(CODE_RESPONSE);
+        }
+        return polls < 2 ? tokenPending() : jsonResponse({ access_token: "sess-1" });
+      },
+      // The opener ran and reported that it could not start the browser — the
+      // case the user otherwise waits out in silence.
+      openBrowser: async () => false,
+    });
+    const result = await h.run();
+    expect(result.sessionToken).toBe("sess-1");
+    expect(h.err.data).toContain(
+      "warning: could not open a browser — open the URL above to approve this login",
+    );
+    // Still printed in full, so the flow completes by copy-paste.
+    expect(h.err.data).toContain("Open https://ui/device?user_code=ABCD-EFGH");
+  });
+
+  it("stays quiet about the browser when the opener succeeds", async () => {
+    // Regression guard: this passed before the warning existed and must keep
+    // passing, so the honest message never becomes noise on a working machine.
+    const h = harness({
+      responder: (call) =>
+        call.url.endsWith("/api/auth/device/code")
+          ? jsonResponse(CODE_RESPONSE)
+          : jsonResponse({ access_token: "sess-1" }),
+    });
+    await h.run();
+    expect(h.err.data).not.toContain("could not open a browser");
+    expect(h.err.data).not.toContain("warning:");
   });
 
   it("hints at API keys under CI=true, and only there", async () => {
