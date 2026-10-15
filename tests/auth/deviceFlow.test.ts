@@ -576,4 +576,11 @@ describe("spawnOpener", () => {
     // exist wherever they run; `-e ""` makes it exit immediately.
     expect(await spawnOpener(process.execPath, ["-e", ""])).toBe(true);
   });
+
+  it("reports success for an opener that starts and then fails on its own", async () => {
+    // The deliberate boundary: a started process is the answer, because waiting
+    // for the opener to exit is what detaching avoids — an xdg-open that holds
+    // the terminal until the browser closes would stall the whole login.
+    expect(await spawnOpener(process.execPath, ["-e", "process.exit(1)"])).toBe(true);
+  });
 });
