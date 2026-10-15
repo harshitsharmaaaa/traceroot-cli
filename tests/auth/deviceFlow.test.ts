@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { browserOpenCommand, runDeviceFlow } from "../../src/auth/deviceFlow.js";
+import { browserOpenCommand, runDeviceFlow, spawnOpener } from "../../src/auth/deviceFlow.js";
 import { CliError, ExitCode } from "../../src/output.js";
 import { type FetchCall, createFakeFetch, jsonResponse } from "../helpers/fakeFetch.js";
 import { StringSink } from "../helpers/stringSink.js";
@@ -522,5 +522,22 @@ describe("browserOpenCommand", () => {
   it("uses the native opener on macOS and Linux", () => {
     expect(browserOpenCommand("darwin", "https://ui/d")).toEqual(["open", ["https://ui/d"]]);
     expect(browserOpenCommand("linux", "https://ui/d")).toEqual(["xdg-open", ["https://ui/d"]]);
+  });
+});
+
+describe("spawnOpener", () => {
+  it("reports failure when the opener command does not exist", async () => {
+    // The realistic case: a headless box with no xdg-open. Node reports ENOENT
+    // on the error event a tick after spawn returns, so answering synchronously
+    // would report a browser that never opened.
+    expect(await spawnOpener("traceroot-cli-no-such-opener-9f3a2b", ["https://ui/device"])).toBe(
+      false,
+    );
+  });
+
+  it("reports success when the opener command starts", async () => {
+    // The node binary running these tests is the one executable guaranteed to
+    // exist wherever they run; `-e ""` makes it exit immediately.
+    expect(await spawnOpener(process.execPath, ["-e", ""])).toBe(true);
   });
 });

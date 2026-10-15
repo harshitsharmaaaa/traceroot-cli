@@ -343,19 +343,45 @@ export function browserOpenCommand(platform: NodeJS.Platform, url: string): [str
 }
 
 /**
- * Opens `url` with the platform opener, detached so the CLI's poll loop never
- * waits on the browser. Resolves `false` when the spawn fails synchronously.
+ * Spawns an opener command detached, so the CLI's poll loop never waits on the
+ * browser, and reports whether the child process actually started.
+ *
+ * Node reports a command it could not execute — missing (`ENOENT`), not
+ * executable (`EACCES`), or no process slot (`EAGAIN`/`EMFILE`/`ENFILE`) — on
+ * the `error` event one tick after `spawn` returns, so answering synchronously
+ * would always claim success and a machine with no `xdg-open` would be told a
+ * browser had opened. Node emits exactly one of `spawn` and `error`, so
+ * awaiting that pair reports the truth without waiting on a timer.
+ *
+ * What a `true` here does not promise: an opener that starts and then fails on
+ * its own (an `xdg-open` with no registered handler exits non-zero, which is
+ * visible only to someone still waiting for the child — exactly what detaching
+ * avoids), and an opener that genuinely succeeds on a machine with no browser
+ * to show. Exported for tests.
  */
+export async function spawnOpener(cmd: string, args: string[]): Promise<boolean> {
+  try {
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    child.unref();
+    return await new Promise<boolean>((resolve) => {
+      child.once("spawn", () => resolve(true));
+      // `on`, not `once`: the listener must stay attached whatever the verdict,
+      // because an unhandled `error` event on a ChildProcess throws.
+      child.on("error", () => resolve(false));
+      // Both events arrive on the nextTick queue, which drains before the check
+      // phase, so an immediate that has seen neither means Node reported
+      // nothing either way — claim success rather than hang the login.
+      setImmediate(() => resolve(true));
+    });
+  } catch {
+    // `spawn` itself threw, which means malformed options rather than a command
+    // that is not installed. The promise above never rejects.
+    return false;
+  }
+}
+
+/** Opens `url` with the platform opener; see {@link spawnOpener}. */
 async function openBrowserForPlatform(url: string): Promise<boolean> {
   const [cmd, args] = browserOpenCommand(process.platform, url);
-  return new Promise((resolve) => {
-    try {
-      const child = spawn(cmd, args, { stdio: "ignore", detached: true });
-      child.on("error", () => resolve(false));
-      child.unref();
-      resolve(true);
-    } catch {
-      resolve(false);
-    }
-  });
+  return spawnOpener(cmd, args);
 }
