@@ -26,6 +26,10 @@ function task(overrides: Record<string, unknown> = {}): string {
     verifyCommand: null,
     interactive: false,
     existingInstrumentation: [],
+    // The channel the hard rules describe. Empty is the degraded case — no file
+    // holds the key, so the agent's environment carries it — and the tests that
+    // are about the channel name it themselves.
+    credentialFiles: [],
     ...overrides,
   });
 }
@@ -199,6 +203,30 @@ describe("the env file the entry point is told to load", () => {
       expect(text).not.toContain('/ ".env")');
       expect(text).not.toContain('new URL(".env"');
     }
+  });
+});
+
+describe("where the task says the agent's own credential is", () => {
+  it("names the file when a file the application loads holds the key", () => {
+    // `buildAgentEnv` withholds the variable over the same answer, so a rule
+    // that still claimed the key was in the environment would send an agent
+    // whose SDK reports no credential to report that rather than to check the
+    // load that would fix it.
+    const text = task({ envFiles: ["./.env"], credentialFiles: ["/repo/.env"] });
+
+    expect(text).toContain("`TRACEROOT_API_KEY` is **not** in your environment");
+    expect(text).not.toContain("is already set in your environment");
+  });
+
+  it("still tells an agent that does hold the key in its environment so", () => {
+    // No file holds it — git tracks the one setup would have written, or the
+    // key came out of the user's own shell — so the environment is the channel,
+    // and sending that agent after a file would send it after one that holds
+    // nothing.
+    const text = task({ envFiles: ["./.env"], credentialFiles: [] });
+
+    expect(text).toContain("is already set in your environment");
+    expect(text).not.toContain("**not** in your environment");
   });
 });
 

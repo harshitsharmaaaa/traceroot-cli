@@ -27,6 +27,22 @@ export interface BuildSetupTaskInput {
   pythonInterpreter?: string | null;
   /** Env files near the service, named so the agent does not go hunting. */
   envFiles?: readonly string[];
+  /**
+   * Every file the application can read the TraceRoot credential out of — the
+   * same list `buildAgentEnv` and `verifyApplication` are given, settled once
+   * by the caller so the three cannot come to disagree.
+   *
+   * Only its emptiness is read here, because the files themselves are already
+   * named to the agent as {@link envFiles}: it decides which channel the hard
+   * rules describe, and `buildAgentEnv` withholds the variable over exactly the
+   * same answer.
+   *
+   * Required rather than optional, for the reason `verifyApplication` gives its
+   * own copy: an optional one is satisfied by omitting it, and omitting it here
+   * tells the agent its key is in an environment the launch has just withheld
+   * it from — which is the one thing this field exists to prevent.
+   */
+  credentialFiles: readonly string[];
 }
 
 function bullet(lines: string[]): string {
@@ -40,8 +56,11 @@ function bullet(lines: string[]): string {
  * agent starts — the agent is never asked to pick, because a wrong pick produces
  * a confident, wrong success. It carries an exact SDK version rather than
  * "install the latest", so two runs of `traceroot setup` install the same thing.
- * It contains no credentials: the key reaches the agent through its process
- * environment only.
+ * It contains no credentials. Where the key is instead depends on the channel
+ * the run settled: a file the application loads in the ordinary case, and the
+ * agent's own process environment when there is no such file — `buildAgentEnv`
+ * decides that over the same `credentialFiles`, and the hard rules below say
+ * which it was.
  *
  * The final section defines "done" as the application having run once, and not
  * as a permalink: neither SDK prints one, so a step that waited for it waited
@@ -237,6 +256,24 @@ export function buildSetupTask(input: BuildSetupTaskInput): string {
   // section exists only because there is a file to name.
   const envFile = envFiles[0] ?? null;
 
+  // Where the agent's own credential is, which is no longer always "in your
+  // environment". `buildAgentEnv` withholds the variable whenever a file the
+  // application loads holds the key, so that nothing the agent runs incidentally
+  // — the project's own test suite above all — can export a trace of its own.
+  //
+  // Said flatly, as this rule used to say it, that is a claim the agent acts on:
+  // it is told not to grep for the variable and, if the SDK reports no
+  // credential, to report that rather than to check the load that would fix it.
+  const whereTheKeyIs =
+    input.credentialFiles.length === 0
+      ? "`TRACEROOT_API_KEY` is already set in your environment — checked before you started. Do " +
+        "not confirm it, print it or grep for it. If the SDK reports at runtime that it is " +
+        "missing, say so in your report."
+      : "`TRACEROOT_API_KEY` is **not** in your environment — a file the application loads holds " +
+        "it instead, and the load you add in step 3 is what gets it to the SDK. Do not print it, " +
+        "grep for it or copy it anywhere else. If the SDK reports at runtime that it is missing, " +
+        "that load is the first thing to check.";
+
   // Where "not at module scope" actually is, which differs by runtime: the
   // guard is a Python idiom with no Node counterpart.
   const runPath =
@@ -395,9 +432,7 @@ ${bullet([
     "to that provider and nothing about the structure around them, while an agent framework's " +
     "also covers the tool calls and the loop that makes them. Step 4 says how to tell, and what " +
     "is left for you either way.",
-  "`TRACEROOT_API_KEY` is already set in your environment — checked before you started. Do not " +
-    "confirm it, print it or grep for it. If the SDK reports at runtime that it is missing, say " +
-    "so in your report.",
+  whereTheKeyIs,
   "Never print, log, echo or hardcode an API key.",
   "Do not write the key into any file — not source, not config, not a `.env`. You never write it " +
     "anywhere, so you never need to check what is tracked or gitignored.",

@@ -120,6 +120,7 @@ describe("the interpreter the task recommends and the one the agent may run", ()
       interactive: false,
       existingInstrumentation: [],
       pythonInterpreter,
+      credentialFiles: [],
     });
   }
 
@@ -176,14 +177,17 @@ describe("the interpreter the task recommends and the one the agent may run", ()
 describe("where the credential is allowed to appear", () => {
   const KEY = "tr-a-long-enough-credential";
 
-  it("puts it in the child's environment and leaves the parent's alone", () => {
-    // Not argv (visible in `ps`), not the task file (written to disk), and not
-    // the parent's own environment, which would leak into every later child in
-    // this process.
+  it("puts it in the child's environment when that is the only channel", () => {
+    // No file the application can read the key out of, so the environment is
+    // all there is — and an agent that cannot authenticate cannot prove any of
+    // its own work. Not argv (visible in `ps`), not the task file (written to
+    // disk), and not the parent's own environment, which would leak into every
+    // later child in this process.
     const parentEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
     const env = buildAgentEnv({
       parentEnv,
       credential: makeSecret(KEY),
+      credentialFiles: [],
       host: "https://api.example.test",
     });
 
@@ -191,6 +195,27 @@ describe("where the credential is allowed to appear", () => {
     expect(env.TRACEROOT_HOST_URL).toBe("https://api.example.test");
     expect(env.PATH).toBe("/usr/bin");
     expect(parentEnv.TRACEROOT_API_KEY).toBeUndefined();
+  });
+
+  it("withholds it when a file the application loads already holds it", () => {
+    // Every command the agent runs inherits this variable and the SDK
+    // initializes from it unasked, so an agent that runs the project's own test
+    // suite to check its work exported a trace per instrumented call — into the
+    // user's project, under the same key as the application's own traces. With
+    // the key in the file the entry point loads, the application reaches it the
+    // way production will deliver it and the suite reaches nothing.
+    const env = buildAgentEnv({
+      parentEnv: { PATH: "/usr/bin" },
+      credential: makeSecret(KEY),
+      credentialFiles: ["/repo/.env"],
+      host: "https://api.example.test",
+    });
+
+    expect("TRACEROOT_API_KEY" in env).toBe(false);
+    // The host stays either way: it is not a credential, nothing exports
+    // without a key, and an agent pointed at the wrong instance is a long
+    // debugging session for a user.
+    expect(env.TRACEROOT_HOST_URL).toBe("https://api.example.test");
   });
 
   for (const interactive of [false, true]) {
@@ -203,6 +228,7 @@ describe("where the credential is allowed to appear", () => {
         cwd: "/repo",
         parentEnv: { PATH: "/usr/bin" },
         credential: makeSecret(KEY),
+        credentialFiles: [],
         host: "https://api.example.test",
         runProcess: run,
       });
@@ -213,4 +239,30 @@ describe("where the credential is allowed to appear", () => {
       expect(launched?.stdin ?? "").not.toContain(KEY);
     });
   }
+
+  it("carries the withholding through the launch, not only the env builder", async () => {
+    // `launchAgent` builds the child's environment itself, so a gate the caller
+    // cannot reach through it is a gate the run never applies.
+    const { run, runs } = fakeRunProcess();
+    const invocation = buildInvocation({ agentId: "claude", task: "do it", interactive: false });
+    await launchAgent({
+      invocation,
+      task: "do it",
+      cwd: "/repo",
+      parentEnv: { PATH: "/usr/bin" },
+      credential: makeSecret(KEY),
+      credentialFiles: ["/repo/.env"],
+      host: "https://api.example.test",
+      runProcess: run,
+    });
+
+    const launched = runs[0];
+    expect(launched).toBeDefined();
+    expect("TRACEROOT_API_KEY" in (launched?.env ?? {})).toBe(false);
+    expect(launched?.env.TRACEROOT_HOST_URL).toBe("https://api.example.test");
+    // And the key is still redacted out of everything the launch does carry,
+    // which is the property the list above never depended on.
+    expect(launched?.args.join(" ")).not.toContain(KEY);
+    expect(launched?.stdin ?? "").not.toContain(KEY);
+  });
 });

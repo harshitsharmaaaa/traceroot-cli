@@ -85,6 +85,7 @@ describe("every surface that says where to initialize", () => {
         verifyCommand: null,
         interactive: false,
         existingInstrumentation: [],
+        credentialFiles: [],
       }),
     ],
     [
