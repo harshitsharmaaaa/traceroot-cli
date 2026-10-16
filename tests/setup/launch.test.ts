@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { buildAgentEnv, buildInvocation, launchAgent } from "../../src/setup/launch.js";
 import { makeSecret } from "../../src/setup/secret.js";
+import { buildSetupTask, taskInterpreters } from "../../src/setup/task.js";
+import type { DetectedService } from "../../src/setup/types.js";
 import { fakeRunProcess } from "./helpers.js";
 
 describe("reaching a skill that lives outside the working directory", () => {
@@ -33,6 +35,20 @@ describe("reaching a skill that lives outside the working directory", () => {
     expect(invocation.args.indexOf("--add-dir")).toBeLessThan(
       invocation.args.indexOf("--disallowedTools"),
     );
+  });
+});
+
+describe("which agents can be launched at all", () => {
+  it("refuses an agent setup has no verified way to drive", () => {
+    // Setup only offers the agents in `LAUNCHABLE_AGENTS`, so nothing should
+    // reach here with another id — and if something does, failing at the
+    // invocation is better than spawning a run whose sandbox, network and
+    // package-manager cache nobody has established.
+    for (const agentId of ["codex", "generic"] as const) {
+      expect(() => buildInvocation({ agentId, task: "t", interactive: false })).toThrow(
+        /cannot be launched/,
+      );
+    }
   });
 });
 
@@ -79,6 +95,81 @@ describe("letting the agent run what it was told to run", () => {
   it("adds no allowlist flag when there is nothing to allow", () => {
     const { args } = buildInvocation({ agentId: "claude", task: "t", interactive: false });
     expect(args).not.toContain("--allowedTools");
+  });
+});
+
+describe("the interpreter the task recommends and the one the agent may run", () => {
+  const ROOT = "/repo";
+  const SERVICE_PATH = "api";
+
+  function task(pythonInterpreter: string | null): string {
+    return buildSetupTask({
+      service: {
+        path: SERVICE_PATH,
+        language: "python",
+        framework: null,
+        entryPoint: "main.py",
+        packageManager: "pip",
+        testCommand: null,
+        evidence: [],
+      } as unknown as DetectedService,
+      root: ROOT,
+      sdk: { package: "traceroot", version: "1.2.3", source: "registry" },
+      skillPath: ".claude/skills/traceroot-instrument-repo",
+      verifyCommand: null,
+      interactive: false,
+      existingInstrumentation: [],
+      pythonInterpreter,
+    });
+  }
+
+  function rules(pythonInterpreter: string | null): string[] {
+    return buildInvocation({
+      agentId: "claude",
+      task: "t",
+      interactive: false,
+      allowedPrograms: taskInterpreters(pythonInterpreter, ROOT, SERVICE_PATH),
+    }).args;
+  }
+
+  /**
+   * The program out of the task's own run command, read back rather than
+   * restated. Both halves of each assertion below therefore come from the
+   * prose, so a change to how the task names the interpreter moves the
+   * expectation with it instead of leaving it behind.
+   */
+  function programInRunCommand(text: string): string {
+    const command = /run it with: `([^`]+)`/.exec(text)?.[1];
+    expect(command).toBeDefined();
+    return (command as string).split(" ")[0];
+  }
+
+  it("allows the relative spelling the run command uses for a virtualenv in the tree", () => {
+    const interpreter = "/repo/api/.venv/bin/python";
+    const named = programInRunCommand(task(interpreter));
+    // Non-vacuous only because the two spellings differ. The absolute path is
+    // the one a caller has in hand, and it is not the one the task gives.
+    expect(named).not.toBe(interpreter);
+    expect(rules(interpreter)).toContain(`Bash(${named}:*)`);
+    // And the absolute path as well: the install step names it that way,
+    // quotes included, because there the quoting is written for the agent.
+    expect(rules(interpreter)).toContain(`Bash(${interpreter}:*)`);
+  });
+
+  it("allows the absolute spelling when the interpreter sits outside the repository", () => {
+    const interpreter = "/opt/homebrew/bin/python3";
+    const named = programInRunCommand(task(interpreter));
+    expect(named).toBe(interpreter);
+    expect(rules(interpreter)).toContain(`Bash(${interpreter}:*)`);
+  });
+
+  it("allows the virtualenv the task tells a service without one to create", () => {
+    // Not covered by `python3` or `python` being allowed outright: the task
+    // says to stop using those and use the new virtualenv from then on, and a
+    // permission rule matches the start of a command literally.
+    const named = /run the application with `([^`]+)` throughout/.exec(task(null))?.[1];
+    expect(named).toBeDefined();
+    expect(rules(null)).toContain(`Bash(${named}:*)`);
   });
 });
 

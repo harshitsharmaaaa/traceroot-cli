@@ -131,13 +131,11 @@ export function buildInvocation(input: BuildInvocationInput): AgentInvocation {
             promptVia: "stdin",
             interactive: false,
           };
-    case "codex":
-      return interactive
-        ? { program: "codex", args: [], promptVia: "argv", interactive: true }
-        : { program: "codex", args: ["exec", "-"], promptVia: "stdin", interactive: false };
     default:
-      // `generic` has no launchable binary; the machine routes this case to the
-      // prompt-only path before ever getting here.
+      // Only the agents in `LAUNCHABLE_AGENTS` reach here with a case of their
+      // own. `generic` has no launchable binary at all, and the machine routes
+      // it — like any id setup does not drive — to the prompt-only path before
+      // ever getting here.
       throw new Error(`agent '${agentId}' cannot be launched`);
   }
 }
