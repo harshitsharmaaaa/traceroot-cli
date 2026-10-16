@@ -1768,8 +1768,7 @@ const wroteEnvKeys = new WeakMap<
  * blind to a nested `.gitignore`, to `.git/info/exclude` and to the user's
  * global excludes, and therefore liable to add a duplicate rule for a path
  * already covered. `git check-ignore` is the authority on the question, and the
- * answer belongs to the user to act on. Laminar and PostHog both ask and never
- * edit; it is the right line.
+ * answer belongs to the user to act on.
  *
  * Warn rather than refuse, which is the opposite of what the tracked case does,
  * and deliberately. Tracked means the key travels on the next `git commit -a`
