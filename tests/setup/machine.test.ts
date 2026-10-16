@@ -1875,7 +1875,7 @@ describe("a suite that was already failing", () => {
     expect(plain(err.data)).toContain("nothing ran it before the code was instrumented");
   });
 
-  it("runs the baseline in the virtualenv the real check uses", async () => {
+  it("runs every check in the virtualenv the real check uses", async () => {
     // The command is `pytest` as the project documents it, which resolves only
     // because the user's shell has the virtualenv activated. Handed the CLI's
     // own environment it fails to spawn, and the measurement the whole
@@ -1899,11 +1899,16 @@ describe("a suite that was already failing", () => {
     expect(result.ok).toBe(true);
     const checks = process.runs.filter((r) => r.program === "pytest");
     expect(checks).toHaveLength(3);
-    // The baseline is the first of the three. The two verification runs after
-    // it get the same treatment from `verifyApplication`, which is a separate
-    // change on another branch; this pins the measurement that was never
-    // happening at all.
-    expect(checks[0]?.env.PATH).toContain(join(dir, ".venv", "bin"));
+    // All three of them: the baseline, and the two verification runs after it.
+    // Asserted together because they are one claim — the comparison is only a
+    // comparison if every run is made in the same environment — and because
+    // pinning the baseline alone is what let this through the first time. The
+    // baseline was handed the interpreter, the verification was not, and a run
+    // stopped on `pytest` not being found after the instrumentation had
+    // already succeeded. Nothing failed until it was in front of a user.
+    for (const check of checks) {
+      expect(check.env.PATH).toContain(join(dir, ".venv", "bin"));
+    }
     expect(ctx.checkpoint.applicationBaseline).toMatchObject({ ran: true, exitCode: 0 });
   });
 

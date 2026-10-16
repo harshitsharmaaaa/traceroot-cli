@@ -2840,6 +2840,26 @@ const verifyApplicationStage: StageDefinition = {
       baseline: ctx.checkpoint.applicationBaseline ?? null,
       cwd: service.path === "." ? ctx.root : join(ctx.root, service.path),
       parentEnv: deps.env,
+      // The same virtualenv the baseline measured in. `detect_stack` names the
+      // check as the project documents it — `pytest`, not `.venv/bin/pytest` —
+      // and that command resolves for the user because their shell has the
+      // virtualenv activated. Without this both runs below spawn against the
+      // CLI's own environment and fail with ENOENT after the instrumentation
+      // itself had succeeded, which reads to the user as changes that broke
+      // their suite. It is also the comparison's premise: a baseline taken in
+      // one environment and a verification taken in another are not the same
+      // measurement, so the two must not disagree about where `pytest` is.
+      //
+      // Resolved here rather than carried over from `instrument`. Creating the
+      // virtualenv is one of the things the agent is told to do, so an answer
+      // from before the launch is null in exactly the case this matters; and
+      // this stage also runs on a resume, where nothing instrumented anything
+      // in this process and there is no earlier answer to carry. The import
+      // check resolves it again for the first of those reasons.
+      interpreter:
+        service.language === "python"
+          ? detectPythonEnvironment(ctx.root, service.path, deps.env).interpreter
+          : null,
       credential: credential.key,
       host: session.host,
       // The credential-free run is only credential-free if the key goes out of
