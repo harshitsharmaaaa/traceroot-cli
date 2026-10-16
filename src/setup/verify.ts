@@ -408,14 +408,14 @@ export async function verifyApplication(
         skippedReason: null,
       },
       failure: alreadyBroken
-          ? null
-          : {
-        phase: "with",
-        output: first.output,
-        program: parsed.program,
-        spawnFailed: first.spawnFailed,
-        spawnErrorCode: first.spawnErrorCode,
-      },
+        ? null
+        : {
+            phase: "with",
+            output: first.output,
+            program: parsed.program,
+            spawnFailed: first.spawnFailed,
+            spawnErrorCode: first.spawnErrorCode,
+          },
       withheld: [],
       ranAt,
     };

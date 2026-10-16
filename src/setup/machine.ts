@@ -2990,7 +2990,13 @@ const verifyApplicationStage: StageDefinition = {
     // The fix for *that* is the branch below, and it swallowed a command that
     // could not be started. All three conflated "did not run" with "ran and
     // failed"; a fourth will too unless the distinction is made here.
-    if (verification.outcome === "inconclusive") {
+    // A command that could not be started cannot have been baselined either, so
+    // it arrives here as "inconclusive" and this branch would swallow it — and
+    // with it the one thing the user can act on, that the command was never
+    // found. Three fixes in a row conflated "did not run" with "ran and
+    // failed"; the spawn-failure fields this change adds are what finally let
+    // the two be told apart, so the distinction is made here.
+    if (verification.outcome === "inconclusive" && failure?.spawnFailed !== true) {
       // Not a failure of this run, by one of two routes, and the sentence has
       // to say which. Measured and already red is a finding about the project.
       // Never measured is the absence of one, and it carries the failing output
@@ -3028,11 +3034,11 @@ const verifyApplicationStage: StageDefinition = {
             : unstartable.spawnErrorCode === "EACCES"
               ? `\`${unstartable.program}\` is not executable`
               : `\`${unstartable.program}\` could not be started${unstartable.spawnErrorCode === undefined ? "" : ` (${unstartable.spawnErrorCode})`}`;
-        // Of the rest, only one is a claim this run can support. "Failed after
-        // instrumentation" was printed whether or not anything had established
-        // that it passed before — which on a suite that was already red sent the
-        // user looking for a fault in work that had just been done correctly.
-        const measuredBefore = verification.baseline?.ran === true;
+      // Of the rest, only one is a claim this run can support. "Failed after
+      // instrumentation" was printed whether or not anything had established
+      // that it passed before — which on a suite that was already red sent the
+      // user looking for a fault in work that had just been done correctly.
+      const measuredBefore = verification.baseline?.ran === true;
       const message =
         reason !== null
           ? `\`${command}\` could not be run: ${reason}.`

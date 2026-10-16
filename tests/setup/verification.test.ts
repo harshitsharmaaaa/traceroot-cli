@@ -14,12 +14,12 @@ import { ExitCode } from "../../src/output.js";
 import type { RunProcessOptions, RunProcessResult } from "../../src/setup/exec.js";
 import { makeSecret } from "../../src/setup/secret.js";
 import {
+  THIN_TRACE_MAX_SPANS,
+  WINDOW_GRACE_MS,
   isThinTrace,
   pollForTrace,
   spanPhrase,
-  THIN_TRACE_MAX_SPANS,
   thinTraceFinding,
-  WINDOW_GRACE_MS,
 } from "../../src/setup/trace.js";
 import { runBaselineCheck, verifyApplication } from "../../src/setup/verify.js";
 import { fakeRunProcess } from "./helpers.js";

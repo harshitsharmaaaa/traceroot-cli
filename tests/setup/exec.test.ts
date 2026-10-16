@@ -365,6 +365,8 @@ describe("a survivor that ignored SIGTERM", () => {
     },
     19000,
   );
+});
+
 describe("why a program could not be started", () => {
   it("reports ENOENT for a program that is not on PATH", async () => {
     // The flag alone cannot distinguish this from a program that exists and

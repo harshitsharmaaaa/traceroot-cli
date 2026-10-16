@@ -2185,19 +2185,17 @@ describe("a suite that was already failing", () => {
     expect(ctx.checkpoint.applicationBaseline).toMatchObject({ ran: true, exitCode: 0 });
   });
 
-  it("says nothing about the suite when the baseline could not run", async () => {
+  it("pauses and names a check that could not be started", async () => {
     // An un-run baseline has `exitCode: null`, and `null !== 0`. Warning on the
     // code alone announced that the project's suite does not pass whenever the
     // measurement simply did not happen — a false claim about the user's code,
     // made on every run where the command could not be spawned.
     //
-    // Silence about the suite is right here, but it is not the whole answer:
-    // a command that cannot spawn cannot be baselined either, so this branch
-    // also swallows a spawn failure, and the one thing the user could act on —
-    // that `pytest` was never found — does not reach them. Distinguishing the
-    // two needs the spawn-failure fields on the verification failure, which
-    // arrive with the branch that adds them rather than here, so that is where
-    // the distinction is made and tested.
+    // Silence about the suite is right; silence about the command is not. This
+    // branch is where the two are finally told apart: a command that cannot
+    // spawn cannot be baselined, so it arrives as inconclusive, and until the
+    // spawn-failure fields existed the inconclusive path swallowed it along
+    // with the one thing the user could act on.
     pythonRepo();
     initGit();
     const process = fakeRunProcess({
@@ -2221,10 +2219,12 @@ describe("a suite that was already failing", () => {
     // The run carries on rather than failing: nothing was measured, so there is
     // nothing to fail on. What it does not yet do is say that the command could
     // not be started.
-    expect(result.error).toBeNull();
-    // And it does not claim the suite passes either — only that nothing here
-    // established it.
-    expect(plain(err.data)).toContain("could not establish whether");
+    // The outcome is still inconclusive. What changed is the handling: a
+    // command that could not be started is reported, not warned about and
+    // walked past.
+    expect(ctx.application?.outcome).toBe("inconclusive");
+    expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
+    expect(result.error?.message).toContain("could not be run");
   });
 
   it("does not retake the baseline on a resumed instrumentation", async () => {
