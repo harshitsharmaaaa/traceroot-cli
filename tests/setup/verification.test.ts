@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -258,6 +266,100 @@ describe("proving the application runs without the credential", () => {
 
     expect(readFileSync(file, "utf8")).toBe(`TRACEROOT_API_KEY=${KEY}\n`);
     expect(readdirSync(root)).toEqual([".env.traceroot"]);
+  });
+
+  it("puts the rest back when one credential file cannot be restored", async () => {
+    // One failed rename used to end the restoration there and then, leaving
+    // every file after it parked under a name its owner never chose — the loss
+    // the whole move-aside exists to prevent, inflicted on the files it was not
+    // even failing on.
+    //
+    // A directory in the way of the first file's own path is the cheapest way
+    // to make a rename fail for a reason the process cannot talk itself out of,
+    // and it is one of the cases `unpark` is deliberately unconditional about:
+    // something has appeared at the original path, and the parked copy is still
+    // the user's only copy of what was there.
+    const { root, file } = repoWithCredentialFile();
+    const projectEnv = join(root, ".env");
+    writeFileSync(projectEnv, `DATABASE_URL=postgres:///app\nTRACEROOT_API_KEY=${KEY}\n`, "utf8");
+    let calls = 0;
+    const run = async (): Promise<RunProcessResult> => {
+      calls += 1;
+      // The second run is the credential-free one, with both files parked.
+      if (calls === 2) {
+        mkdirSync(file);
+      }
+      return PROCESS_OK;
+    };
+
+    const failure = await verifyApplication({
+      command: "npm test",
+      cwd: "/repo",
+      parentEnv: {},
+      credential: makeSecret(KEY),
+      host: "https://api.example.test",
+      credentialFiles: [file, projectEnv],
+      interpreter: null,
+      runProcess: run,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    // The file parked behind the one that could not go back went back, with
+    // everything that was in it.
+    expect(readFileSync(projectEnv, "utf8")).toContain("DATABASE_URL=postgres:///app");
+    expect(existsSync(`${projectEnv}.traceroot-setup-hidden`)).toBe(false);
+    // And the failure still surfaces rather than being spent on the files it
+    // did not stop, naming the file and where it is now — that one the user has
+    // to move back by hand.
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toMatch(/could not put .*\.env\.traceroot back/);
+    expect((failure as Error).message).toContain(`${file}.traceroot-setup-hidden`);
+    expect(readFileSync(`${file}.traceroot-setup-hidden`, "utf8")).toBe(
+      `TRACEROOT_API_KEY=${KEY}\n`,
+    );
+  });
+
+  it("reports the file it could not put back even when the run itself failed", async () => {
+    // Two failures at once, and they are not equal. A check that crashed is a
+    // report this run was going to make either way, while a file left under a
+    // name its owner never chose outlives the process and nobody but them can
+    // move it back. So the restoration is what the error says, and the crash
+    // rides along as its cause rather than being the thing that gets heard.
+    const { root, file } = repoWithCredentialFile();
+    const projectEnv = join(root, ".env");
+    writeFileSync(projectEnv, `TRACEROOT_API_KEY=${KEY}\n`, "utf8");
+    let calls = 0;
+    const run = async (): Promise<RunProcessResult> => {
+      calls += 1;
+      if (calls === 2) {
+        mkdirSync(file);
+        throw new Error("spawn exploded");
+      }
+      return PROCESS_OK;
+    };
+
+    const failure = await verifyApplication({
+      command: "npm test",
+      cwd: "/repo",
+      parentEnv: {},
+      credential: makeSecret(KEY),
+      host: "https://api.example.test",
+      credentialFiles: [file, projectEnv],
+      interpreter: null,
+      runProcess: run,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect((failure as Error).message).toMatch(/could not put .*\.env\.traceroot back/);
+    expect((failure as Error).cause).toBeInstanceOf(Error);
+    expect(((failure as Error).cause as Error).message).toBe("spawn exploded");
+    // And the one it could put back is back, crash or no crash.
+    expect(existsSync(`${projectEnv}.traceroot-setup-hidden`)).toBe(false);
+    expect(readFileSync(projectEnv, "utf8")).toBe(`TRACEROOT_API_KEY=${KEY}\n`);
   });
 
   it("moves nothing when this run wrote no credential file", async () => {

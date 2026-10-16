@@ -116,12 +116,23 @@ function park(file: string): Parked | null {
  * unconditional about the destination: if anything has since appeared at the
  * original path, the user's own credential file is still the copy that has to
  * survive this function.
+ *
+ * Throws with the parked name in it rather than passing the `rename` error on
+ * as it stands: the file is still on disk under a name its owner never chose,
+ * and the one thing this failure owes them is where to find it.
  */
 function unpark(entry: Parked | null): void {
   if (entry === null || !existsSync(entry.parked)) {
     return;
   }
-  renameSync(entry.parked, entry.original);
+  try {
+    renameSync(entry.parked, entry.original);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `could not put ${entry.original} back after running the application without it: ${reason}. Your file is still on disk, at ${entry.parked} — move it back to ${entry.original}.`,
+    );
+  }
 }
 
 /**
@@ -296,8 +307,11 @@ async function withoutCredentialFiles<T>(
       }
     }
   } catch (err) {
-    restore(parked);
-    throw err;
+    // A file this run could not put back outlives the run, so it is the failure
+    // the user has to act on; the parking failure that brought us here is the
+    // reason, and travels along as its cause.
+    const failure = restore(parked);
+    throw failure === null ? err : new Error(failure.message, { cause: err });
   }
   if (parked.length === 0) {
     return { result: await body(), withheld: [] };
@@ -305,7 +319,14 @@ async function withoutCredentialFiles<T>(
 
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
   // The last net, for a `process.exit()` from somewhere else in the tree.
-  const rescue = (): void => restore(parked);
+  //
+  // Both of these drop what `restore` hands back, and have to: an exit handler
+  // has nobody left to report to and a signal handler nothing to throw to. What
+  // they can still do is attempt every file rather than stop at the first one
+  // that will not go back, which is the whole of what is available here.
+  const rescue = (): void => {
+    restore(parked);
+  };
   const onSignal = (signal: NodeJS.Signals): void => {
     restore(parked);
     for (const name of signals) {
@@ -319,20 +340,59 @@ async function withoutCredentialFiles<T>(
     process.once(name, onSignal);
   }
   process.once("exit", rescue);
+  // The body's outcome is held rather than returned or rethrown from inside the
+  // `try`, so that the files go back first and a file that could not go back is
+  // still reported afterwards: that one outlives the process and the user has to
+  // move it by hand, where a failed check is a report this run was going to make
+  // anyway. So the restoration speaks first, with the body's own failure as its
+  // cause.
+  let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+  let failure: Error | null = null;
   try {
-    return { result: await body(), withheld: parked.map((entry) => entry.original) };
+    outcome = { ok: true, value: await body() };
+  } catch (error) {
+    outcome = { ok: false, error };
   } finally {
-    restore(parked);
+    failure = restore(parked);
     for (const name of signals) {
       process.removeListener(name, onSignal);
     }
     process.removeListener("exit", rescue);
   }
+  if (failure !== null) {
+    throw outcome.ok ? failure : new Error(failure.message, { cause: outcome.error });
+  }
+  if (!outcome.ok) {
+    throw outcome.error;
+  }
+  return { result: outcome.value, withheld: parked.map((entry) => entry.original) };
 }
 
-/** Puts every parked file back. Safe to call more than once. */
-function restore(parked: readonly Parked[]): void {
+/**
+ * Puts every parked file back and hands back the first failure, or null when
+ * they all went back. Safe to call more than once.
+ *
+ * Every entry is attempted before anything is reported. Stopping at the first
+ * failed rename would leave every file behind it parked under a name its owner
+ * never chose — the loss this whole dance exists to prevent, visited on the
+ * files it was not even failing on — and one file that cannot go back is no
+ * reason to abandon the rest.
+ *
+ * The failure comes back rather than being thrown so the caller can finish its
+ * own cleanup before deciding where it surfaces: the signal and exit handlers
+ * have listeners to drop and nowhere to throw to, and the paths that can
+ * propagate do it once the listeners are gone.
+ */
+function restore(parked: readonly Parked[]): Error | null {
+  let failure: Error | null = null;
   for (const entry of parked) {
-    unpark(entry);
+    try {
+      unpark(entry);
+    } catch (err) {
+      // The first one, kept: it names the first file the user has to deal with,
+      // and a later success must not be what they hear about instead.
+      failure ??= err instanceof Error ? err : new Error(String(err));
+    }
   }
+  return failure;
 }
