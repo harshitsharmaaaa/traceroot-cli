@@ -308,3 +308,61 @@ describe("a Ctrl+C part-way through a captured run", () => {
     15000,
   );
 });
+
+describe("a survivor that ignored SIGTERM", () => {
+  it.skipIf(WINDOWS)(
+    "is still escalated to SIGKILL once the run has settled",
+    async () => {
+      // The run settles a quarter-second after the direct child exits, which is
+      // the moment a grandchild that ignored SIGTERM is still running. The
+      // escalation is the only thing left that ends it, so it has to keep the
+      // CLI alive long enough to fire: this harness awaits the run and then has
+      // nothing else to do, which is the shape of the last stage of a run.
+      const dir = await workspace();
+      const marker = join(dir, "survived");
+      const grandchild = join(dir, "grandchild.cjs");
+      const child = join(dir, "child.cjs");
+      const harness = join(dir, "harness.mjs");
+      const module = new URL("../../dist/setup/exec.js", import.meta.url).href;
+
+      await writeFile(
+        grandchild,
+        [
+          // Ignoring SIGTERM is what leaves only the escalation, and `inherit`
+          // below is what makes it the holder of the run's stdio pipes.
+          'process.on("SIGTERM", () => {});',
+          'setTimeout(() => require("node:fs").writeFileSync(process.argv[2], "late"), 3500);',
+        ].join("\n"),
+      );
+      await writeFile(
+        child,
+        [
+          'const { spawn } = require("node:child_process");',
+          'spawn(process.execPath, [process.argv[2], process.argv[3]], { stdio: "inherit" });',
+          "setTimeout(() => {}, 8000);",
+        ].join("\n"),
+      );
+      await writeFile(
+        harness,
+        [
+          `const { runProcess } = await import(${JSON.stringify(module)});`,
+          "await runProcess({",
+          "  program: process.execPath,",
+          `  args: [${JSON.stringify(child)}, ${JSON.stringify(grandchild)}, ${JSON.stringify(marker)}],`,
+          `  cwd: ${JSON.stringify(dir)},`,
+          '  env: { PATH: process.env.PATH ?? "" },',
+          '  stdio: "capture",',
+          "  timeoutMs: 300,",
+          "});",
+        ].join("\n"),
+      );
+
+      const result = spawnSync(process.execPath, [harness], { encoding: "utf8" });
+      await sleep(4000);
+
+      expect(result.status).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+    },
+    19000,
+  );
+});
