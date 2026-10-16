@@ -493,6 +493,7 @@ describe("agent task", () => {
 
   it("scopes to one service and pins the version", () => {
     const task = buildSetupTask({
+      credentialFiles: [],
       service,
       root: "/repo",
       sdk: TEST_SDK,
@@ -515,6 +516,7 @@ describe("agent task", () => {
 
   it("tells a background agent to abort rather than guess", () => {
     const task = buildSetupTask({
+      credentialFiles: [],
       service,
       root: "/repo",
       sdk: TEST_SDK,
@@ -529,6 +531,7 @@ describe("agent task", () => {
 
   it("tells the agent to extend, not duplicate, an existing install", () => {
     const task = buildSetupTask({
+      credentialFiles: [],
       service,
       root: "/repo",
       sdk: TEST_SDK,
@@ -543,6 +546,7 @@ describe("agent task", () => {
 
   it("never embeds a credential", () => {
     const task = buildSetupTask({
+      credentialFiles: [],
       service,
       root: "/repo",
       sdk: TEST_SDK,
@@ -590,6 +594,9 @@ describe("agent invocation", () => {
       parentEnv: { PATH: "/usr/bin" },
       credential: secret,
       host: "https://api.example.test",
+      // No file holds the key, so the environment is the only channel — which
+      // is the case this test is about.
+      credentialFiles: [],
     });
     expect(invocation.args.join(" ")).not.toContain(secret.reveal());
     expect(env.TRACEROOT_API_KEY).toBe(secret.reveal());
@@ -726,6 +733,7 @@ describe("waiting for a trace only when there is one to wait for", () => {
     // Instrumenting emits nothing; running does. Leaving this implicit is how
     // a run ends with working instrumentation and no trace.
     const task = buildSetupTask({
+      credentialFiles: [],
       root: "/repo",
       service: {
         path: ".",
@@ -794,6 +802,7 @@ describe("installing into the interpreter the service runs on", () => {
 describe("everything the task settles so the agent does not have to", () => {
   const task = () =>
     buildSetupTask({
+      credentialFiles: [],
       root: "/repo",
       service: {
         path: "svc",
@@ -876,6 +885,7 @@ describe("everything the task settles so the agent does not have to", () => {
 describe("leaving nothing for the agent to look up", () => {
   const task = (language: "python" | "typescript" = "python") =>
     buildSetupTask({
+      credentialFiles: [],
       root: "/repo",
       service: {
         path: "svc",
@@ -942,6 +952,7 @@ describe("getting the credential setup wrote into the application", () => {
     credentialEnvFile?: string | null;
   }) =>
     buildSetupTask({
+      credentialFiles: [],
       root: "/repo",
       service: {
         path: "svc",
@@ -1089,6 +1100,7 @@ describe("getting the credential setup wrote into the application", () => {
 describe("the task renders whole", () => {
   const render = () =>
     buildSetupTask({
+      credentialFiles: [],
       root: "/repo",
       service: {
         path: "svc",

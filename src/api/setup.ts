@@ -15,7 +15,12 @@ import type { TraceList } from "./client.js";
  * degrades to a documented manual path. Nothing is stubbed to succeed.
  */
 
-/** Raised when an endpoint is absent (404) or not implemented (501). */
+/**
+ * Raised when an endpoint is absent or not implemented: a 501, or a 404 whose
+ * body does not say what was missing. A 404 that names a missing resource is a
+ * {@link SetupApiError} carrying the server's own `detail` instead — see
+ * {@link describesMissingResource}.
+ */
 export class BackendUnavailableError extends Error {
   readonly status: number;
   readonly path: string;
@@ -160,6 +165,33 @@ function errorDetail(body: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Whether a 404's body explains what was missing.
+ *
+ * A 404 means one of two unrelated things — this deployment has no such route,
+ * or the route is there and the thing asked for is not — and the status alone
+ * cannot say which. The body can: a handler refusing a project it cannot find
+ * says so in `detail`, while an unregistered path is answered by the framework
+ * with the bare `Not Found` it generates for anything it cannot route, and a
+ * proxy in front of one answers with HTML or with nothing at all.
+ *
+ * So a 404 counts as a real failure only when its body names the failure, and
+ * an empty, unreadable or boilerplate body still reads as an absent route. The
+ * asymmetry is deliberate: the callers in `setup/machine.ts` degrade to a
+ * documented manual path on {@link BackendUnavailableError}, and a route that
+ * genuinely is missing must keep reaching that fallback.
+ */
+function describesMissingResource(detail: string | undefined): boolean {
+  if (detail === undefined) {
+    return false;
+  }
+  // Trailing punctuation only, so `Not Found.` is still boilerplate. The
+  // comparison is case-insensitive because the same wording is generated as
+  // `Not Found` by the router and written as `Not found` by hand.
+  const text = detail.trim().replace(/\.+$/, "").trim();
+  return text !== "" && text.toLowerCase() !== "not found";
+}
+
 /** Creates the setup API client. No network activity happens on construction. */
 export function createSetupApi(opts: SetupApiOptions): SetupApi {
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
@@ -206,7 +238,9 @@ export function createSetupApi(opts: SetupApiOptions): SetupApi {
       throw new SetupApiError(`request to ${base} failed: ${safe}`, 0);
     }
 
-    if (res.status === 404 || res.status === 501) {
+    // 501 is unambiguous — the route exists and declines to do the work — so it
+    // needs no body to interpret.
+    if (res.status === 501) {
       throw new BackendUnavailableError(options.path, res.status);
     }
 
@@ -216,6 +250,14 @@ export function createSetupApi(opts: SetupApiOptions): SetupApi {
         detail = errorDetail(await res.json());
       } catch {
         // Unreadable / non-JSON error body.
+      }
+      // Read the body, then classify. Declaring every 404 a missing endpoint
+      // before this point reported a project id that does not resolve as a
+      // TraceRoot feature the deployment lacks, and offered a manual workaround
+      // for a server-side gap that was not there, while the server's own
+      // explanation sat unread in the response.
+      if (res.status === 404 && !describesMissingResource(detail)) {
+        throw new BackendUnavailableError(options.path, res.status);
       }
       throw new SetupApiError(detail ?? `request failed with status ${res.status}`, res.status);
     }

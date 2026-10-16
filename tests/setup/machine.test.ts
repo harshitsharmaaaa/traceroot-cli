@@ -22,7 +22,12 @@ import { newCheckpoint, readCheckpoint, writeCheckpoint } from "../../src/setup/
 import { SETUP_EXIT_CODES } from "../../src/setup/errors.js";
 import { type SetupEvent, jsonEmitter } from "../../src/setup/events.js";
 import type { SetupDeps } from "../../src/setup/machine.js";
-import { defaultSetupDeps, runSetupMachine, uniqueKeyName } from "../../src/setup/machine.js";
+import {
+  defaultSetupDeps,
+  projectOptions,
+  runSetupMachine,
+  uniqueKeyName,
+} from "../../src/setup/machine.js";
 import { makeSecret } from "../../src/setup/secret.js";
 import type { SetupContext, SetupFlags } from "../../src/setup/types.js";
 import { wizardEmphasis } from "../../src/setup/wizard.js";
@@ -162,7 +167,7 @@ describe("happy path", () => {
     expect(result.trace?.traceUrl).toBe(odd);
   });
 
-  it("hands the credential to the agent through the environment, not argv", async () => {
+  it("withholds the credential from the agent once a file the application loads holds it", async () => {
     pythonRepo();
     const process = fakeRunProcess({ gitStatus: ["", " M main.py"] });
     const deps = makeDeps({
@@ -175,8 +180,17 @@ describe("happy path", () => {
 
     const agentRun = process.runs.find((r) => r.program === "claude");
     expect(agentRun).toBeDefined();
+    // Never on the command line, whichever channel carries it.
     expect(agentRun?.args.join(" ")).not.toContain("tr-live-project-key-abcd");
-    expect(agentRun?.env.TRACEROOT_API_KEY).toBe("tr-live-project-key-abcd");
+    // This run wrote the credential into a file the entry point loads, so the
+    // environment is no longer the channel and the agent is not given the key.
+    // With it present, anything the agent runs can export a trace — including
+    // the project's own test suite, which is what made a suite-emitted trace
+    // look like proof that the application was instrumented.
+    expect(agentRun?.env.TRACEROOT_API_KEY).toBeUndefined();
+    // The host is not a credential and travels either way, or the agent cannot
+    // tell which deployment it is instrumenting against.
+    expect(agentRun?.env.TRACEROOT_HOST_URL).toBeDefined();
     // The parent environment given to deps must be untouched.
     expect(deps.env.TRACEROOT_API_KEY).toBeUndefined();
   });
@@ -1071,6 +1085,107 @@ describe("the pasted key", () => {
     expect(result.error?.code).toBe("NOT_AUTHENTICATED");
     expect(result.error?.message).toContain("No API key was entered.");
     expect(sentToClient).toEqual([]);
+  });
+});
+
+describe("the project picker's rows", () => {
+  it("tells two projects of the same name apart by their workspaces", () => {
+    // A project name is unique only inside its workspace, and every sign-in
+    // path lists projects across all of them, so this is the ordinary case
+    // rather than an edge one. Labelled with the name alone these two rows were
+    // one choice as far as the reader could see.
+    const options = projectOptions([
+      { project_id: "p_1", project_name: "test", workspace_id: "w_1", workspace_name: "Acme" },
+      { project_id: "p_2", project_name: "test", workspace_id: "w_2", workspace_name: "Globex" },
+    ]);
+
+    // Nothing about what is being chosen changes: the label is still the
+    // project name and the value still the project id.
+    expect(options.map((o) => o.label)).toEqual(["test", "test"]);
+    expect(options.map((o) => o.value)).toEqual(["p_1", "p_2"]);
+    // What the reader has to go on differs, and names the owning workspace.
+    expect(options[0]?.hint).toContain("Acme");
+    expect(options[1]?.hint).toContain("Globex");
+    expect(options[0]?.hint).not.toBe(options[1]?.hint);
+    // An empty hint would satisfy the line above and distinguish nothing.
+    expect(options[0]?.hint).toBeTruthy();
+    expect(options[1]?.hint).toBeTruthy();
+  });
+
+  it("tells them apart when the two workspaces are named the same as well", () => {
+    // Nothing refuses a second workspace with an existing name, and the
+    // dashboard's default name for a new one comes from the owner's email
+    // domain — so two people onboarding from one company each get a workspace
+    // called the same thing, and anyone invited to both reads that name twice.
+    // The workspace name alone therefore does not separate these rows.
+    const options = projectOptions([
+      { project_id: "p_1", project_name: "test", workspace_id: "w_1", workspace_name: "Acme" },
+      { project_id: "p_2", project_name: "test", workspace_id: "w_2", workspace_name: "Acme" },
+    ]);
+
+    expect(options[0]?.hint).not.toBe(options[1]?.hint);
+    expect(options[0]?.hint).toContain("w_1");
+    expect(options[1]?.hint).toContain("w_2");
+  });
+
+  it("names the workspace by its id when the payload carries no name for it", () => {
+    // A type obligation rather than a deployment anyone runs: one old enough to
+    // omit the name is old enough to 404 the route. What matters is that the
+    // hint still identifies a workspace instead of going blank.
+    const [option] = projectOptions([
+      { project_id: "p_1", project_name: "test", workspace_id: "w_1", workspace_name: null },
+    ]);
+
+    expect(option?.hint).toBe("w_1");
+  });
+
+  it("is what the project question is actually built from", async () => {
+    // The rows above are only worth anything if the prompt uses them, so this
+    // reaches the real question through a sign-in and reads what it was handed.
+    pythonRepo();
+    const setupApi = fakeSetupApi({
+      listProjects: async () => [
+        { project_id: "p_1", project_name: "test", workspace_id: "w_1", workspace_name: "Acme" },
+        { project_id: "p_2", project_name: "test", workspace_id: "w_2", workspace_name: "Globex" },
+      ],
+      createProjectApiKey: async (input) => ({
+        id: "ak_1",
+        name: input.name,
+        hint: "tr-4444-5555",
+        project_id: input.projectId,
+        scope: input.scope ?? "admin",
+        expires_at: null,
+        key: "tr-browser-minted-key-1234",
+      }),
+    });
+    const base = makeDeps({
+      auth: authEmpty(),
+      setupApi,
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
+      // The second `test`, which is unreachable without something telling the
+      // two apart.
+      answers: ["p_2"],
+    });
+    const asked: Array<Parameters<typeof base.select>[0]> = [];
+    const deps = {
+      ...base,
+      select: (input: Parameters<typeof base.select>[0]) => {
+        asked.push(input);
+        return base.select(input);
+      },
+    };
+    const { ctx } = makeCtx({ canPrompt: true, flags: { browser: true, agent: "claude" } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    const question = asked.find((input) => input.message.includes("Which project"));
+    expect(question?.options.map((o) => `${o.label} — ${o.hint}`)).toEqual([
+      "test — Acme (w_1)",
+      "test — Globex (w_2)",
+    ]);
+    expect(result.ok).toBe(true);
+    expect(ctx.project?.projectId).toBe("p_2");
   });
 });
 

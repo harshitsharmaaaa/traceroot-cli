@@ -60,7 +60,7 @@ import {
   sdkPackageFor,
 } from "./sdk.js";
 import { type Secret, makeSecret } from "./secret.js";
-import { type SelectFn, interactiveSelect } from "./select.js";
+import { type SelectFn, type SelectOption, interactiveSelect } from "./select.js";
 import { startLineSpinner } from "./spinner.js";
 import { detectStack, normalizeLanguage } from "./stack.js";
 import { buildSetupTask, manualInstructions, parseCompletion, taskInterpreters } from "./task.js";
@@ -1145,6 +1145,62 @@ async function chooseWorkspace(
 }
 
 /**
+ * The workspace a project belongs to, named the way `status` names every other
+ * identity: the name first, its id after.
+ *
+ * The id is not decoration. A workspace name is not unique either — nothing
+ * refuses a second workspace called the same thing, and the dashboard's default
+ * name for a new one is derived from the owner's email domain, so two
+ * colleagues onboarding from the same company both get a workspace with the
+ * same name and anyone invited to both reads it twice. Qualifying two projects
+ * named `test` with `Acme` would leave them reading identically all over again,
+ * which is the whole defect. The id ends it: a project name is unique within
+ * its workspace, so name plus workspace id cannot repeat.
+ *
+ * Written plainly rather than through `identity()`: this string lands in a
+ * prompt's hint, which the prompt layer dims as a whole, and a nested dim would
+ * end that dimming early for the rest of the line.
+ */
+function describeWorkspace(project: ProjectSummary): string {
+  const name = project.workspace_name?.trim() ?? "";
+  const id = project.workspace_id.trim();
+  if (name === "") {
+    // Every deployment that serves the project list sends a name, and one old
+    // enough to omit it is old enough to answer the route with a 404 — so this
+    // is a type obligation rather than a case to design for. The id is still an
+    // answer, which is what matters: the hint identifies a workspace instead of
+    // going blank.
+    return id;
+  }
+  return id === "" ? name : `${name} (${id})`;
+}
+
+/**
+ * The project picker's rows.
+ *
+ * The label stays the bare project name, because the project is the thing being
+ * chosen; the owning workspace goes in the dimmed hint beside it, which is what
+ * `hint` is for. A project name is only unique inside its workspace and every
+ * sign-in path lists projects across all of them, so a name appearing several
+ * times is the ordinary case here — and labelled with the name alone those rows
+ * are one choice as far as the reader can see, which makes a mis-pick both
+ * undetectable and consequential: it is what sends a repository's traces to the
+ * wrong project.
+ *
+ * Qualified unconditionally rather than only where today's list collides. A row
+ * that renders the same on every run is one a person can recognise from the
+ * last run and a test can pin, while a hint that appears only on a collision
+ * hides the workspace from exactly the account that is about to grow one.
+ */
+export function projectOptions(projects: readonly ProjectSummary[]): SelectOption[] {
+  return projects.map((project) => ({
+    value: project.project_id,
+    label: project.project_name,
+    hint: describeWorkspace(project),
+  }));
+}
+
+/**
  * Picks the project a repository will report to, given everything the caller
  * can already see.
  *
@@ -1231,7 +1287,7 @@ async function chooseProject(
   const answer = await deps.select({
     stage,
     message: "Which project should receive these traces?",
-    options: projects.map((p) => ({ value: p.project_id, label: p.project_name })),
+    options: projectOptions(projects),
   });
   const picked = projects.find((p) => p.project_id === answer);
   if (picked === undefined) {
@@ -2296,6 +2352,11 @@ const instrument: StageDefinition = {
       service,
       root: ctx.root,
       sdk,
+      // The same list the credential-free run takes, so the launch, the task
+      // and the verification cannot disagree about which channel carries the
+      // credential. Non-empty means a file the application loads holds the key,
+      // and the agent is not given it in its environment.
+      credentialFiles: applicationCredentialFiles(ctx),
       // Relative to the agent's cwd, not the repository root.
       //
       // The skill installs at the root — `<root>/.claude/skills/<name>` — while
@@ -2483,6 +2544,7 @@ const instrument: StageDefinition = {
       let observedChangedFiles: string[];
       try {
         result = await launchAgent({
+          credentialFiles: applicationCredentialFiles(ctx),
           invocation: buildInvocation({
             agentId: agent.id,
             task,
