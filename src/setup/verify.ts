@@ -22,16 +22,22 @@ export interface VerifyApplicationInput {
   credential: Secret;
   host: string;
   /**
-   * Absolute path to the dotenv file this run wrote the credential into, or
-   * null when it wrote none — a key that already resolved from the user's own
-   * config is never written to a file at all.
+   * Absolute paths to every file the application could read this credential
+   * out of: the dotenv file this run wrote it into, and the project's own file
+   * when the key resolved from one that was already there. Empty when there is
+   * no such file — a key exported in the user's shell reaches the application
+   * only through the environment, which the second run builds for itself.
    *
-   * Required rather than optional because forgetting it silently empties the
-   * credential-free run of its meaning: the instrumented entry point loads this
-   * file itself, so an environment with `TRACEROOT_API_KEY` removed and the
-   * file still on disk is a second run *with* the key.
+   * Required rather than optional, and a list rather than one path, because
+   * either omission silently empties the credential-free run of its meaning:
+   * the instrumented entry point loads these files itself, so an environment
+   * with `TRACEROOT_API_KEY` removed and any one of them still on disk is a
+   * second run *with* the key. The run that writes nothing because the key is
+   * already in the project's `.env` is exactly that case, and it is the common
+   * one — nothing was written, so a single "the file this run wrote" is null
+   * and the file the application actually reads stays on disk.
    */
-  credentialFile: string | null;
+  credentialFiles: readonly string[];
   runProcess: RunProcess;
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -83,6 +89,17 @@ function park(file: string): Parked | null {
     return null;
   }
   const parked = `${file}${PARKED_SUFFIX}`;
+  // `rename` replaces an existing target on POSIX without a word, and what
+  // would be replaced here is a credential file some earlier run parked and
+  // never got to put back — the run killed outright, which is the case the name
+  // above exists for. That run's copy is the user's only copy: the file at
+  // `file` is the one this run wrote in its place. Refusing leaves both on disk
+  // for the user to settle, which is the one outcome that cannot lose a file.
+  if (existsSync(parked)) {
+    throw new Error(
+      `${parked} is already there, and moving ${file} aside would overwrite it. It is a copy of ${file} left behind by a run that was interrupted while the application ran without its credential. Put it back or delete it, then run setup again.`,
+    );
+  }
   try {
     renameSync(file, parked);
   } catch (err) {
@@ -117,14 +134,13 @@ function unpark(entry: Parked | null): void {
  * production outage waiting for the day someone deploys without one, so setup
  * proves it here instead of asking.
  *
- * Absent means absent from both places the application can read it. The
- * instrumentation task tells the agent to load the credential file from the
- * entry point — `load_dotenv("./.env.traceroot")` — so deleting
- * `TRACEROOT_API_KEY` from the child environment and leaving the file on disk
+ * Absent means absent from every place the application can read it. The
+ * instrumented entry point loads its credential file itself, so deleting
+ * `TRACEROOT_API_KEY` from the child environment and leaving that file on disk
  * hands the second run the same key back off disk, and the check passes for
- * free. The file is moved aside for the duration and restored in a `finally`,
- * because a verification step that can lose a user's credential file is worse
- * than one that proves too little.
+ * free. Every file that holds the key is moved aside for the duration and
+ * restored in a `finally`, because a verification step that can lose a user's
+ * credential file is worse than one that proves too little.
  *
  * `TRACEROOT_API_KEY` is *deleted* from the child environment rather than set
  * empty, because SDKs commonly treat an empty string as "configured but blank"
@@ -215,7 +231,7 @@ export async function verifyApplication(
     };
   }
 
-  const second = await withoutCredentialFile(input.credentialFile, () =>
+  const second = await withoutCredentialFiles(input.credentialFiles, () =>
     input.runProcess({
       program: parsed.program,
       args: parsed.args,
@@ -249,31 +265,49 @@ export async function verifyApplication(
 }
 
 /**
- * Runs `body` with the credential file moved aside, and puts it back however
- * `body` ends.
+ * Runs `body` with every credential file moved aside, and puts them all back
+ * however `body` ends.
+ *
+ * All of them or none: a refusal part-way through puts back what it already
+ * moved before it propagates, because a run that stops here still has to leave
+ * the repository as it found it.
  *
  * `finally` covers a throw, a non-zero exit, a timeout and an abort — the
  * process runner resolves rather than rejects for the last three. It does not
  * cover a signal: Node's default `SIGINT` ends the process without unwinding,
  * which is a plausible thing for a user to do in the middle of a ten-minute
  * test suite and would leave their credential file sitting under another name.
- * So the signals are handled for exactly as long as the file is parked, and
+ * So the signals are handled for exactly as long as the files are parked, and
  * then re-raised so the interrupt still means what it meant.
  */
-async function withoutCredentialFile<T>(
-  file: string | null,
+async function withoutCredentialFiles<T>(
+  files: readonly string[],
   body: () => Promise<T>,
 ): Promise<{ result: T; withheld: readonly string[] }> {
-  const parked = file === null ? null : park(file);
-  if (parked === null) {
+  const parked: Parked[] = [];
+  // Deduplicated: the file this run wrote and the file the key resolved from
+  // are often one file, and parking a path twice would move the second run's
+  // own parked copy.
+  try {
+    for (const file of new Set(files)) {
+      const entry = park(file);
+      if (entry !== null) {
+        parked.push(entry);
+      }
+    }
+  } catch (err) {
+    restore(parked);
+    throw err;
+  }
+  if (parked.length === 0) {
     return { result: await body(), withheld: [] };
   }
 
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
   // The last net, for a `process.exit()` from somewhere else in the tree.
-  const rescue = (): void => unpark(parked);
+  const rescue = (): void => restore(parked);
   const onSignal = (signal: NodeJS.Signals): void => {
-    unpark(parked);
+    restore(parked);
     for (const name of signals) {
       process.removeListener(name, onSignal);
     }
@@ -286,12 +320,19 @@ async function withoutCredentialFile<T>(
   }
   process.once("exit", rescue);
   try {
-    return { result: await body(), withheld: [parked.original] };
+    return { result: await body(), withheld: parked.map((entry) => entry.original) };
   } finally {
-    unpark(parked);
+    restore(parked);
     for (const name of signals) {
       process.removeListener(name, onSignal);
     }
     process.removeListener("exit", rescue);
+  }
+}
+
+/** Puts every parked file back. Safe to call more than once. */
+function restore(parked: readonly Parked[]): void {
+  for (const entry of parked) {
+    unpark(entry);
   }
 }
