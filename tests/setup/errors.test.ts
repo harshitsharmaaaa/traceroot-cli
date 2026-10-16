@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { ExitCode } from "../../src/output.js";
 import { SETUP_EXIT_CODES, type SetupErrorCode, SetupError } from "../../src/setup/errors.js";
+import { runCli } from "../helpers/runCli.js";
 
 /** The numbers the rest of the CLI has already spent, and what they mean there. */
 const SHARED: ReadonlyMap<number, string> = new Map([
@@ -65,5 +67,39 @@ describe("setup's exit codes against the table the whole CLI publishes", () => {
 
     expect(failed.exitCode).toBe(SETUP_EXIT_CODES.AGENT_FAILED);
     expect(failed.exitCode).not.toBe(ExitCode.network);
+  });
+});
+
+describe("publishing the statuses a script is told it can rely on", () => {
+  /** The leading code column of every markdown table row in a file. */
+  const tabulated = (markdown: string): number[] =>
+    [...markdown.matchAll(/^\| `(\d+)` \|/gm)].map((row) => Number(row[1]));
+
+  const own = OWN.map((code) => SETUP_EXIT_CODES[code]);
+
+  it("gives each of setup's own statuses a row in the README's table", () => {
+    // The mapping above calls itself a stable, script-facing contract, while
+    // the one table a script author can read published 1-5 as though they were
+    // everything any command could hand back — so a caller that met 14, or a
+    // 130 from an abandoned prompt, had nothing to look it up in.
+    const documented = tabulated(readFileSync(new URL("../../README.md", import.meta.url), "utf8"));
+
+    for (const code of [...own, SETUP_EXIT_CODES.INTERRUPTED]) {
+      expect(documented).toContain(code);
+    }
+  });
+
+  it("says in `traceroot --help` that the shared five are not all of them", () => {
+    const { stdout, status } = runCli("--help");
+    // Only the appendix: the band is a claim about exit codes, and the word
+    // would also match a command summary that happened to mention setup.
+    const published = stdout.slice(stdout.indexOf("Exit codes:"));
+
+    expect(status).toBe(0);
+    expect(published).toContain("setup");
+    // Derived, so a status added above cannot quietly fall outside the band
+    // this advertises.
+    expect(published).toContain(`${Math.min(...own)}-${Math.max(...own)}`);
+    expect(published).toContain(String(SETUP_EXIT_CODES.INTERRUPTED));
   });
 });

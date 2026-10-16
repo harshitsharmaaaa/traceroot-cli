@@ -253,12 +253,27 @@ export const runProcess: RunProcess = (options) =>
     };
 
     /**
+     * Whether a process was ever started, which both checks below have to ask.
+     *
+     * A failed spawn still hands back a child object, but one with no pid, and
+     * it emits `error` with no `exit` to follow — so neither check can be read
+     * straight off the child. `child.kill` on it reaches `kill(0, …)`, which
+     * signals the CLI's OWN process group rather than a child; and `exited`
+     * never becomes true, which read a child that never existed as live and so
+     * left the escalation armed with nothing for it to reach.
+     */
+    const hasProcess = (): boolean => child.pid !== undefined;
+
+    /**
      * Signals the child, and on POSIX its whole process group.
      *
      * `child.kill` reaches only the direct child, so a grandchild survived it
      * and kept both the work and the stdio pipes alive.
      */
     const signalChild = (signal: NodeJS.Signals): void => {
+      if (!hasProcess()) {
+        return;
+      }
       if (pgid !== undefined) {
         signalGroup(pgid, signal);
         return;
@@ -267,7 +282,12 @@ export const runProcess: RunProcess = (options) =>
     };
 
     /** True while anything this run started is still running. */
-    const stillRunning = (): boolean => (pgid === undefined ? !exited : signalGroup(pgid, 0));
+    const stillRunning = (): boolean => {
+      if (!hasProcess()) {
+        return false;
+      }
+      return pgid === undefined ? !exited : signalGroup(pgid, 0);
+    };
 
     const kill = (): void => {
       signalChild("SIGTERM");
