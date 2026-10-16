@@ -35,6 +35,24 @@ export interface VerifyApplicationInput {
   baseline?: VerificationRun | null;
   cwd: string;
   parentEnv: NodeJS.ProcessEnv;
+  /**
+   * The virtualenv interpreter the service runs on, or null when there is none.
+   *
+   * Both runs below spawn the project's own check, and `detect_stack` names
+   * that check the way the project documents it — `pytest`, not
+   * `.venv/bin/pytest` — because that is what a user types. It resolves for
+   * them because their shell has the virtualenv activated; this process's
+   * environment does not have it, so without this the spawn fails with ENOENT
+   * on the commonest shape of Python project there is, after the application
+   * has already been instrumented correctly.
+   *
+   * Required rather than optional, and for a reason this field has already
+   * earned: an optional one that defaults to null type-checks when the caller
+   * simply omits it, which is exactly how the baseline came to be the only run
+   * that had the virtualenv. Required, omitting it is a compile error at the
+   * call site rather than an ENOENT in front of a user.
+   */
+  interpreter: string | null;
   credential: Secret;
   host: string;
   /**
@@ -216,8 +234,15 @@ export async function verifyApplication(
 
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+  // The virtualenv first, for both runs and not only the baseline. The command
+  // is `pytest` as the project documents it, and it lives inside the
+  // virtualenv; a baseline that could spawn it and two verification runs that
+  // could not is how this ended a real run on "`pytest` could not be run" with
+  // the instrumentation already in place and correct.
+  const onPath = withVenvOnPath(input.parentEnv, input.interpreter);
+
   const withEnv: NodeJS.ProcessEnv = {
-    ...input.parentEnv,
+    ...onPath,
     TRACEROOT_API_KEY: input.credential.reveal(),
     TRACEROOT_HOST_URL: input.host,
   };
@@ -226,7 +251,7 @@ export async function verifyApplication(
   // the parent environment happens to carry, and the comparison stops being
   // about the key at all.
   const withoutEnv: NodeJS.ProcessEnv = {
-    ...input.parentEnv,
+    ...onPath,
     TRACEROOT_HOST_URL: input.host,
   };
   // biome-ignore lint/performance/noDelete: absent and empty are different to an SDK
@@ -360,13 +385,14 @@ export interface BaselineCheckInput {
  * was done correctly.
  *
  * No credential: nothing is instrumented yet, so `TRACEROOT_API_KEY` could not
- * reach any SDK even if it were set, and adding it would make this run differ
- * from the question being asked. Everything else about the environment is the
- * same, virtualenv included — a baseline that cannot find `pytest` where the
- * real check finds it is comparing two different things. The output is not
- * captured for reporting either: the exit code is the whole of what a baseline
- * is for, and a suite's pre-existing failure output is not setup's to put in
- * front of the user.
+ * reach any SDK even if it were set, and running with one would make this run
+ * differ from the question being asked. Not adding one is not enough — an
+ * ambient key from the user's shell is taken back out as well. Everything else
+ * about the environment is the same, virtualenv included — a baseline that
+ * cannot find `pytest` where the real check finds it is comparing two
+ * different things. The output is not captured for reporting either: the exit
+ * code is the whole of what a baseline is for, and a suite's pre-existing
+ * failure output is not setup's to put in front of the user.
  *
  * Never throws for a failing command: a non-zero exit is the answer, not an
  * error. A command that cannot be parsed returns an un-run result, which reads
@@ -378,14 +404,25 @@ export async function runBaselineCheck(input: BaselineCheckInput): Promise<Verif
   if (parsed === null) {
     return NOT_RUN;
   }
+  // The same environment the real check gets, minus the credential. A baseline
+  // run in a different environment than the run it is compared against is not a
+  // baseline — and a credential is not part of that environment, however it got
+  // there: a developer's shell exports `TRACEROOT_API_KEY` as a matter of
+  // course, and inheriting it here would silently make this run the thing it
+  // exists to be measured against.
+  //
+  // Copied before the key goes, because `withVenvOnPath` hands back the very
+  // object it was given when there is no virtualenv to add, and deleting in
+  // place would reach into the caller's own environment and take the credential
+  // out of the runs that need it.
+  const env: NodeJS.ProcessEnv = { ...withVenvOnPath(input.parentEnv, input.interpreter) };
+  // biome-ignore lint/performance/noDelete: absent and empty are different to an SDK
+  delete env.TRACEROOT_API_KEY;
   const result = await input.runProcess({
     program: parsed.program,
     args: parsed.args,
     cwd: input.cwd,
-    // The same environment the real check gets, minus the credential. A
-    // baseline run in a different environment than the run it is compared
-    // against is not a baseline.
-    env: withVenvOnPath(input.parentEnv, input.interpreter),
+    env,
     stdio: "capture",
     timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: input.signal,

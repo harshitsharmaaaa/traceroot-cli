@@ -78,6 +78,36 @@ describe("running the project's own check twice", () => {
     expect("TRACEROOT_API_KEY" in (withoutKey?.env ?? {})).toBe(false);
   });
 
+  it("puts the virtualenv on PATH for both runs, not only the baseline", async () => {
+    // `detect_stack` names the project's check the way the project documents it
+    // — `pytest`, not `.venv/bin/pytest` — and that command exists only inside
+    // the virtualenv. The baseline was given the virtualenv and these two runs
+    // were not, so a project whose check is a repo-local `pytest` measured its
+    // baseline fine and then ended the run, after the application had been
+    // instrumented correctly, on "`pytest` could not be run".
+    const { run, runs } = fakeRunProcess();
+    await verifyApplication({
+      command: "pytest",
+      cwd: "/repo/api",
+      parentEnv: { PATH: "/usr/bin" },
+      credential: makeSecret(KEY),
+      host: "https://api.example.test",
+      credentialFiles: [],
+      interpreter: "/repo/api/.venv/bin/python",
+      runProcess: run,
+    });
+
+    // Both of them. One run reaching the command and the other not would make
+    // the credential-free comparison about which binary was found.
+    expect(runs).toHaveLength(2);
+    const onPath = `/repo/api/.venv/bin${delimiter}/usr/bin`;
+    expect(runs[0]?.env.PATH).toBe(onPath);
+    expect(runs[1]?.env.PATH).toBe(onPath);
+    // And the virtualenv changes nothing about what the two runs differ by.
+    expect(runs[0]?.env.TRACEROOT_API_KEY).toBe(KEY);
+    expect("TRACEROOT_API_KEY" in (runs[1]?.env ?? {})).toBe(false);
+  });
+
   it("reports the window the application ran in, so a trace can be tied to it", async () => {
     // The only thing that separates this run's trace from the project's other
     // traffic. Measured around the run that had the credential, because that is
@@ -469,6 +499,45 @@ describe("telling a suite setup broke from one that was already broken", () => {
 
     expect(baseline.ran).toBe(true);
     expect(runs[0]?.env.PATH).toBe(`/repo/api/.venv/bin${delimiter}/usr/bin`);
+  });
+
+  it("runs the baseline without an ambient credential, and leaves the caller's own env alone", async () => {
+    // The assertion above covers a parent environment that had no key in it. A
+    // developer's shell commonly exports one, and a baseline that inherits it
+    // is no longer the run it gets compared against: this measurement exists to
+    // say what the project's check did before this run touched anything.
+    const { run, runs } = fakeRunProcess();
+    const activated = { PATH: "/usr/bin", TRACEROOT_API_KEY: "tr-ambient-shell-value" };
+    await runBaselineCheck({
+      command: "pytest",
+      cwd: "/repo/api",
+      parentEnv: activated,
+      interpreter: "/repo/api/.venv/bin/python",
+      runProcess: run,
+    });
+
+    // Deleted rather than blanked, the way the two verification runs do it: an
+    // SDK commonly reads an empty string as "configured but blank" and takes a
+    // different path than it does for absent.
+    expect("TRACEROOT_API_KEY" in (runs[0]?.env ?? {})).toBe(false);
+    expect(runs[0]?.env.PATH).toBe(`/repo/api/.venv/bin${delimiter}/usr/bin`);
+    expect(activated.TRACEROOT_API_KEY).toBe("tr-ambient-shell-value");
+
+    // Including on the path with no virtualenv to add, where the environment
+    // the baseline is handed is the caller's own object rather than a copy of
+    // it. Removing the key in place there would reach back into the run.
+    const bare = { PATH: "/usr/bin", TRACEROOT_API_KEY: "tr-ambient-shell-value" };
+    const plain = fakeRunProcess();
+    await runBaselineCheck({
+      command: "npm test",
+      cwd: "/repo",
+      parentEnv: bare,
+      interpreter: null,
+      runProcess: plain.run,
+    });
+
+    expect("TRACEROOT_API_KEY" in (plain.runs[0]?.env ?? {})).toBe(false);
+    expect(bare.TRACEROOT_API_KEY).toBe("tr-ambient-shell-value");
   });
 
   it("calls a failure inconclusive when the suite was already failing", async () => {
@@ -947,6 +1016,34 @@ describe("how much of the application the trace covers", () => {
     expect(result.found).toBe(true);
     expect(result.found && result.attribution.spanCount).toBeNull();
     expect(isThinTrace(result.found ? result.attribution.spanCount : null)).toBe(false);
+  });
+
+  it("copies the count onto the record the report reads, not only the attribution", async () => {
+    // The thin-trace machinery is wired over `trace.spanCount`: the report's
+    // verdict and its trace row both read the count off the verification, and
+    // the poll filled in only the attribution's copy. So every surface that can
+    // remark on a thin trace existed and the count never arrived at any of
+    // them. `--resume` renders the report from the checkpointed trace as well,
+    // which is the other half of why the count belongs on the record rather
+    // than only in the invocation that polled.
+    const thin = await look([row(1)]);
+    expect(thin.found && thin.trace.spanCount).toBe(1);
+    expect(isThinTrace(thin.found ? thin.trace.spanCount : null)).toBe(true);
+
+    const covered = await look([row(7)]);
+    expect(covered.found && covered.trace.spanCount).toBe(7);
+  });
+
+  it("leaves the count off the record when the response reported none", async () => {
+    // Absent and zero are different answers and have to stay different.
+    // `TraceVerification` spells "the response did not say" as a missing field,
+    // so a row without `span_count` leaves it missing rather than carrying a
+    // zero the report would print as "no spans".
+    const result = await look([row(undefined)]);
+
+    expect(result.found).toBe(true);
+    expect(result.found && "spanCount" in result.trace).toBe(false);
+    expect(isThinTrace(result.found ? result.trace.spanCount : null)).toBe(false);
   });
 
   it("refuses a count that is not a whole number of spans", async () => {
