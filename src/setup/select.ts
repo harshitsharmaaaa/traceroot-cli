@@ -78,11 +78,18 @@ export async function selectFrom(input: SelectInput, terminal: SelectTerminal): 
   });
 
   if (isCancel(choice)) {
-    cancel("Setup cancelled.");
+    // `isCancel` is clack's Ctrl+C and Escape, and nothing else — a question
+    // the user never answered rather than one they answered no to. That is
+    // `INTERRUPTED`, not `CANCELLED`: declining is a decision and exits 0,
+    // while an interrupt has to be non-zero or `traceroot setup && <next step>`
+    // carries straight on through the keypress that was meant to stop it.
+    // An explicit decline never reaches here; it comes back as a value and is
+    // checked by the caller.
+    cancel("Setup interrupted.");
     throw new SetupError({
       stage: input.stage,
-      code: "CANCELLED",
-      message: "Setup cancelled.",
+      code: "INTERRUPTED",
+      message: "Setup interrupted.",
     });
   }
   return String(choice);

@@ -6,9 +6,26 @@ import {
   S_STEP_SUBMIT,
   S_WARN,
 } from "@clack/prompts";
-import color from "picocolors";
+import { createColors } from "picocolors";
 import { type Writers, logInfo, logProgress, logWarn } from "../output.js";
 import { canRedraw } from "./tty.js";
+
+/**
+ * picocolors, keyed to the stream this module draws on.
+ *
+ * Every line here goes to stderr, and picocolors' own default instance decides
+ * from *stdout*, once, when it is first imported: `FORCE_COLOR`, `--color`,
+ * `CI`, or stdout being a TTY. Those are two different streams, and the frame
+ * was painted according to the wrong one in both directions — `traceroot setup
+ * > out.log` on a terminal dropped every colour from a frame that was still on
+ * screen, while `traceroot setup 2> setup.log` wrote escape codes into the
+ * file.
+ *
+ * `canRedraw` is the question the rest of this module already asks about
+ * `writers.err`, and it answers all three of the things colour has to respect:
+ * a pipe, `TERM=dumb`, and `NO_COLOR`.
+ */
+const color = createColors(canRedraw(process.stderr, process.env));
 
 /**
  * The frame around a setup run: one opening line, one closing block.
@@ -559,6 +576,17 @@ export function wizardProgress(target: FramedOutput, text: string): void {
  * Keeps the `warning:` prefix the rest of the CLI uses. The messages are
  * written as continuations of it ("not inside a git repository — …") and read
  * as fragments without it.
+ *
+ * Opens on a rail line, the way {@link wizardNote} and the stage headings do.
+ * Without it a warning landed flush against whatever the run had just printed —
+ * the answer to a prompt, or a progress line — and an interruption that reads
+ * as the next line of what it interrupts is one a user scrolls straight past.
+ * The separation belongs here rather than in the messages: a `\n` baked into a
+ * string is wrong the moment that string is emitted anywhere else, and under
+ * `--json` it would be a blank line in a log.
+ *
+ * A rail rather than an empty line, because an empty line is a hole in the
+ * frame. `│` reads as blank and keeps the left edge continuous.
  */
 export function wizardWarn(target: FramedOutput, text: string): void {
   if (target.json) {
@@ -570,7 +598,7 @@ export function wizardWarn(target: FramedOutput, text: string): void {
   if (rest.length > 0) {
     lines.push(onRail(rest.join("\n"), (line) => line));
   }
-  target.writers.err.write(`${lines.join("\n")}\n`);
+  target.writers.err.write(`${color.dim(S_BAR)}\n${lines.join("\n")}\n`);
 }
 
 /**
