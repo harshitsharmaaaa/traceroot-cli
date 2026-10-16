@@ -50,9 +50,12 @@ export interface SelectTerminal {
  * streams: the type-ahead this discards is the whole point of the function, and
  * the one way to see it discarded is to be the thing that typed it.
  *
- * Cancellation (Ctrl+C) is a deliberate user action, not a fault: it exits 0
- * with a plain message rather than a stack trace or a failure code, matching how
- * the rest of the CLI treats a declined prompt.
+ * An interrupt is a failure, and a distinct one. Ctrl+C or Escape leaves the
+ * question unanswered: it raises `INTERRUPTED`, which exits 130, so that
+ * `traceroot setup && <next step>` stops at the keypress that was meant to
+ * stop it. Declining is the other thing entirely — an answer, returned as a
+ * value for the caller to act on, and a run that ends on one exits 0. Neither
+ * prints a stack trace.
  */
 export async function selectFrom(input: SelectInput, terminal: SelectTerminal): Promise<string> {
   // Nothing typed before this question appeared is an answer to it. See
