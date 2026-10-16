@@ -115,6 +115,12 @@ export interface SetupApi {
   createApiKey(input: {
     name: string;
     projectId: string;
+    /**
+     * What the new key may do. Sent explicitly rather than left to the server's
+     * default, because the two mint paths in `setup/machine.ts` want different
+     * answers and an implicit one made them look like they agreed.
+     */
+    scope?: "ingest" | "admin";
     expiresInDays: number | null;
   }): Promise<CreatedApiKey>;
   /**
@@ -303,6 +309,7 @@ export function createSetupApi(opts: SetupApiOptions): SetupApi {
         // so sending one could only ever disagree with it.
         body: {
           name: input.name,
+          scope: input.scope,
           expires_in_days: input.expiresInDays,
         },
       });
