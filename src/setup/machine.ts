@@ -2920,12 +2920,16 @@ const verifyApplicationStage: StageDefinition = {
     const serviceDirState = workingDirectoryState(serviceDir);
     if (serviceDirState !== "usable") {
       const wrong = serviceDirState === "missing" ? "no longer exists" : "is not a directory";
+      // Over, not paused, unlike the failures after the spawn: the checkpoint
+      // names the directory that is gone, so a `--resume` would only meet it
+      // again. What this run created comes back out, and the rollback says
+      // what that was — so the remedy must not claim nothing was reverted.
       throw new SetupError({
         stage: "verify_application",
         code: "APP_VERIFICATION_FAILED",
         message: `\`${command}\` could not be run: ${relative(ctx.root, serviceDir) || "."} ${wrong}.`,
         remedy:
-          "Nothing was reverted. The service moved, was deleted or was replaced since the last run — rerun `traceroot setup` from it to start again.",
+          "The service moved, was deleted or was replaced after setup found it — rerun `traceroot setup` from it to start again.",
       });
     }
 

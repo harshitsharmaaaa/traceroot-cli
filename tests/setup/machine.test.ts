@@ -1864,24 +1864,70 @@ describe("failure handling", () => {
     };
   }
 
+  /**
+   * Deps under which the run mints a key — the credential in hand belongs to
+   * another project than `demo` — so a rollback has something to take back,
+   * and a record of what it revoked.
+   */
+  function mintingDeps(runProcess: SetupDeps["runProcess"]): {
+    deps: SetupDeps;
+    revoked: string[];
+  } {
+    const revoked: string[] = [];
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({
+        whoamiResult: async () => whoami({ project_id: "p_other" }),
+        traces: [traceRow()],
+      }),
+      setupApi: fakeSetupApi({
+        listProjects: async () => [
+          { project_id: "p_1", project_name: "demo", workspace_id: "w_1" },
+        ],
+        listApiKeys: async () => [],
+        createApiKey: async ({ name }) => ({
+          id: "ak_1",
+          name,
+          hint: "tr-…9999",
+          project_id: "p_1",
+          scope: "ingest",
+          expires_at: null,
+          key: "tr-minted-secret-value-42",
+        }),
+        revokeApiKey: async (id) => {
+          revoked.push(id);
+        },
+      }),
+      runProcess,
+    });
+    return { deps, revoked };
+  }
+
   it("blames the service directory that went missing, not the test runner", async () => {
     // A `cwd` that is not there comes back ENOENT, the same code as a program
     // that is not on PATH, so this used to tell the user to install `pytest`.
     subdirRepo();
     const process = fakeRunProcess({ gitStatus: ["", " M svc/main.py"] });
-    const deps = makeDeps({
-      auth: authWithKey(),
-      client: fakeApiClient({ traces: [traceRow()] }),
-      runProcess: losingTheServiceDir(process.run, () =>
+    const { deps, revoked } = mintingDeps(
+      losingTheServiceDir(process.run, () =>
         rmSync(join(dir, "svc"), { recursive: true, force: true }),
       ),
-    });
-    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    );
+    const { ctx, err } = makeCtx({ flags: { agent: "claude", project: "demo" } });
     const result = await runSetupMachine(ctx, deps);
 
     expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
     expect(result.error?.message).toContain("svc no longer exists");
     expect(result.error?.message).not.toContain("was not found");
+    // The run is over rather than paused — the checkpoint names the directory
+    // that is gone, so there is nothing to resume — and what it created comes
+    // back out: the key it minted, and the `.env` it wrote that key into.
+    expect(revoked).toEqual(["ak_1"]);
+    expect(existsSync(join(dir, ".env"))).toBe(false);
+    expect(plain(err.data)).toContain("Revoked the API key");
+    // Which is what the remedy says, rather than that nothing was reverted.
+    expect(result.error?.remedy).not.toContain("Nothing was reverted");
+    expect(result.error?.remedy).toContain("start again");
   });
 
   it("says so when the service directory is no longer a directory", async () => {
@@ -1890,21 +1936,24 @@ describe("failure handling", () => {
     // the generic wording — the same dead end the check above exists to remove.
     subdirRepo();
     const process = fakeRunProcess({ gitStatus: ["", " M svc/main.py"] });
-    const deps = makeDeps({
-      auth: authWithKey(),
-      client: fakeApiClient({ traces: [traceRow()] }),
-      runProcess: losingTheServiceDir(process.run, () => {
+    const { deps, revoked } = mintingDeps(
+      losingTheServiceDir(process.run, () => {
         rmSync(join(dir, "svc"), { recursive: true, force: true });
         writeFileSync(join(dir, "svc"), "a file where the service used to be\n");
       }),
-    });
-    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    );
+    const { ctx, err } = makeCtx({ flags: { agent: "claude", project: "demo" } });
     const result = await runSetupMachine(ctx, deps);
 
     expect(result.error?.code).toBe("APP_VERIFICATION_FAILED");
     expect(result.error?.message).toContain("svc is not a directory");
     expect(result.error?.message).not.toContain("ENOTDIR");
-    expect(result.error?.remedy).toContain("rerun");
+    // The same ending as a directory that is gone, for the same reason.
+    expect(revoked).toEqual(["ak_1"]);
+    expect(existsSync(join(dir, ".env"))).toBe(false);
+    expect(plain(err.data)).toContain("Revoked the API key");
+    expect(result.error?.remedy).not.toContain("Nothing was reverted");
+    expect(result.error?.remedy).toContain("start again");
   });
 
   it("fails when no trace arrives before the timeout", async () => {
