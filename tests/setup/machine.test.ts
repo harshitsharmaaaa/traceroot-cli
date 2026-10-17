@@ -28,7 +28,6 @@ import {
   runSetupMachine,
   uniqueKeyName,
 } from "../../src/setup/machine.js";
-import { makeSecret } from "../../src/setup/secret.js";
 import type { SetupContext, SetupFlags } from "../../src/setup/types.js";
 import { wizardEmphasis } from "../../src/setup/wizard.js";
 import { sleep } from "../../src/util/sleep.js";
@@ -771,7 +770,7 @@ describe("authentication", () => {
       auth: authEmpty(),
       setupApi: fakeSetupApi({ listProjects: async () => [] }),
       client: fakeApiClient({ traces: [traceRow()] }),
-      storedCredential: { sessionToken: makeSecret("saved-session-token"), expiresAt: null },
+      storedCredential: { session_token: "saved-session-token" },
     });
     const { ctx } = makeCtx({ canPrompt: false });
 
@@ -804,12 +803,20 @@ describe("authentication", () => {
       client: fakeApiClient({ traces: [traceRow()] }),
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       onWriteConfig: (config) => written.push(config),
-      storedCredential: { sessionToken: makeSecret("saved-session-token"), expiresAt: null },
-      requestDeviceCode: async () => {
+      storedCredential: { session_token: "saved-session-token" },
+      runDeviceFlow: async () => {
         deviceFlowCalls += 1;
         throw new Error("the browser handoff should not have been reached");
       },
     });
+    // Which token the sign-in was built from, read back rather than inferred
+    // from the run succeeding: the fake API answers whatever it is handed.
+    const tokens: string[] = [];
+    const provider = deps.createTokenProvider;
+    deps.createTokenProvider = (opts) => {
+      tokens.push(opts.sessionToken);
+      return provider(opts);
+    };
     const { ctx, err, out } = makeCtx({
       canPrompt: true,
       flags: { browser: true, agent: "claude" },
@@ -820,6 +827,7 @@ describe("authentication", () => {
     expect(result.ok).toBe(true);
     // The entire point: no device code, no link, no waiting.
     expect(deviceFlowCalls).toBe(0);
+    expect(tokens).toEqual(["saved-session-token"]);
     expect(err.data).toContain("Signed in as a returning user. No browser needed.");
     expect(ctx.session?.via).toBe("user-credential");
     expect(ctx.credential?.origin).toBe("minted");
@@ -860,7 +868,7 @@ describe("authentication", () => {
       setupApi,
       client: fakeApiClient({ traces: [traceRow()] }),
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
-      storedCredential: { sessionToken: makeSecret("revoked-session-token"), expiresAt: null },
+      storedCredential: { session_token: "revoked-session-token" },
       onDeleteCredential: (host) => {
         cleared.push(host);
         return true;
@@ -909,7 +917,7 @@ describe("authentication", () => {
       setupApi,
       client: fakeApiClient({ traces: [traceRow()] }),
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
-      storedCredential: { sessionToken: makeSecret("tru-saved-token"), expiresAt: null },
+      storedCredential: { session_token: "tru-saved-token" },
     });
     const { ctx } = makeCtx({ canPrompt: true, flags: { browser: true, agent: "claude" } });
 
@@ -2161,7 +2169,7 @@ describe("the two keys a run mints", () => {
       setupApi,
       client: fakeApiClient({ traces: [traceRow()] }),
       runProcess: process.run,
-      storedCredential: { sessionToken: makeSecret("tru-saved-token"), expiresAt: null },
+      storedCredential: { session_token: "tru-saved-token" },
       onWriteConfig: (config) => configured.push(config),
     });
     return { deps, minted, keyed, configured, runs: process.runs };
@@ -2869,7 +2877,7 @@ describe("what a failed run takes back", () => {
       setupApi,
       client: fakeApiClient({ traces: [traceRow()] }),
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
-      storedCredential: { sessionToken: makeSecret("tru-saved-token"), expiresAt: null },
+      storedCredential: { session_token: "tru-saved-token" },
     });
     return {
       deps:
