@@ -2679,12 +2679,17 @@ function oneLine(note: string, max = 200): string {
  *
  * Called from the failure rather than from the launch, which is what makes the
  * other half of the contract true: a run that worked leaves no transcript
- * behind, because nothing on that path calls this. Its two callers are the two
- * ways an agent can exit 0 having achieved nothing — it reported no edits, or
- * the service still has no initialization in it — and they are the failures
- * whose cause is in the agent's output and nowhere else. The activity feed is a
- * window onto the last few tool calls and has been cleared by the time either
- * check runs, and a `--json` run never had a feed at all.
+ * behind, because nothing on that path calls this. Its callers are the four
+ * ways a launched agent can end this stage with the cause in its own output and
+ * nowhere else — it exited non-zero, it reported no edits, the service still
+ * has no initialization in it, or the SDK it was told to install cannot be
+ * imported.
+ *
+ * The screen is not the fallback for any of them. The activity feed is a window
+ * onto the last few tool calls, it has already been cleared by the time the
+ * exit-0 checks run, the non-zero path leaves a block that scrolls away with
+ * the terminal, and a `--json` run — which is how this is run in CI, where
+ * nobody was watching in the first place — never had a feed at all.
  *
  * The line is built in one place so the two remedies cannot drift apart, and it
  * says what the file is and not only where it is: a path with no reason
@@ -3103,12 +3108,26 @@ const instrument: StageDefinition = {
           observedChangedFiles.length === 0
             ? "No files were changed."
             : `Files changed: ${observedChangedFiles.join(", ")}`;
+        // The one failure whose cause exists only in the agent's output, kept
+        // for the same reason as the two below it. The block left on screen
+        // above is not the same thing: it holds the last few parsed activity
+        // lines, it goes when the terminal does, and under `--json` there was
+        // never a feed to leave anything in.
+        const evidence = keepAgentOutput({
+          root: ctx.root,
+          adapter,
+          output: result.output,
+          credential: credential.key,
+        });
         throw new PausedSetupError({
           stage: "instrument",
           code: "AGENT_FAILED",
           message: `${adapter.displayName} exited with status ${result.exitCode}. ${changed}`,
-          remedy:
-            "Nothing was reverted — your changes are intact. Fix the issue and rerun `traceroot setup --resume`.",
+          remedy: [
+            "Nothing was reverted — your changes are intact.",
+            ...evidence,
+            "Fix the issue and rerun `traceroot setup --resume`.",
+          ].join("\n"),
         });
       }
 
@@ -3232,11 +3251,22 @@ const instrument: StageDefinition = {
       const sdkCheck = await checkSdkImportable(ctx, deps, service, sdk, agentCwd);
       if (sdkCheck !== null && !sdkCheck.importable) {
         const install = installCommand(sdk, service, service.language, sdkCheck.interpreter);
+        // Exit 0, files edited, and the install the task made step 2 did not
+        // take. Why it did not is in the output — a refused command, a cache
+        // with nowhere writable, a PEP 668 refusal — and the feed was cleared
+        // the moment the agent finished, several checks above this one.
+        const evidence = keepAgentOutput({
+          root: ctx.root,
+          adapter,
+          output: result.output,
+          credential: credential.key,
+        });
         throw new PausedSetupError({
           stage: "instrument",
           code: "AGENT_FAILED",
           message: `${adapter.displayName} finished, but \`import ${sdkCheck.check.module}\` fails under ${sdkCheck.check.display} — the ${sdk.package} SDK was not installed, so the instrumented code cannot run.`,
           remedy: [
+            ...evidence,
             "Install it yourself, then rerun `traceroot setup --resume`:",
             `  ${install}`,
             // Only for the `pip` form. `uv` and `poetry` manage their own

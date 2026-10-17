@@ -210,6 +210,19 @@ describe("the `.gitignore` that covers setup's own files", () => {
     expect(existsSync(join(root, ".gitignore"))).toBe(false);
   });
 
+  it("owns the directory called `.traceroot`, not every name ending in it", () => {
+    // The one input the two predicates disagree about, and therefore the only
+    // one that says which is in force: `vendor.traceroot` is a directory whose
+    // name ends with ours and that nobody here owns. A test whose directory
+    // fails both is satisfied by either.
+    const dir = join(root, "vendor.traceroot");
+    mkdirSync(dir, { recursive: true });
+
+    ensureGitignore(dir);
+
+    expect(existsSync(join(dir, ".gitignore"))).toBe(false);
+  });
+
   it("leaves an existing file alone", () => {
     const dir = join(root, ".traceroot");
     mkdirSync(dir, { recursive: true });

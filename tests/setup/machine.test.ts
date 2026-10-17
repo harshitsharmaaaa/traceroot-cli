@@ -3337,13 +3337,19 @@ describe("the agent's own account of a failed run", () => {
     expect(transcript()).toBeNull();
   });
 
-  it("leaves a non-zero exit exactly as it was", async () => {
-    // That path already keeps its transcript on screen and its remedy already
-    // sends the user to read it, so nothing here is added to it.
+  it("keeps the output of an agent that exited non-zero, under --json above all", async () => {
+    // The failure whose cause exists only in the agent's output. The block left
+    // on screen above is not a substitute: it holds the last few parsed
+    // activity lines and it goes when the terminal does — and under `--json`,
+    // which is how this is run in CI, there was never a feed at all. So this
+    // asserts the `--json` run, where the screen defence does not exist and the
+    // output would otherwise be discarded with the process.
     pythonRepo();
     initGit();
     const process = fakeRunProcess({
-      results: { claude: { exitCode: 3, output: "panic: something broke\n" } },
+      results: {
+        claude: { exitCode: 3, output: "reading main.py\npanic: provider refused\n" },
+      },
       gitStatus: ["", " M main.py"],
     });
     const deps = makeDeps({
@@ -3351,16 +3357,56 @@ describe("the agent's own account of a failed run", () => {
       client: fakeApiClient(),
       runProcess: process.run,
     });
-    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+    const { ctx } = makeCtx({ json: true, flags: { agent: "claude" } });
 
     const result = await runSetupMachine(ctx, deps);
 
     expect(result.error?.code).toBe("AGENT_FAILED");
     expect(plain(result.error?.message ?? "")).toContain("status 3");
-    expect(plain(result.error?.remedy ?? "")).toBe(
-      "Nothing was reverted — your changes are intact. Fix the issue and rerun `traceroot setup --resume`.",
-    );
-    expect(transcript()).toBeNull();
+    expect(transcript()).toContain("panic: provider refused");
+    expect(plain(result.error?.remedy ?? "")).toContain(AGENT_OUTPUT_PATH);
+    // And it still says first the thing a user reading an aborted run needs
+    // first, which is that their worktree was left alone.
+    expect(plain(result.error?.remedy ?? "")).toContain("Nothing was reverted");
+  });
+
+  it("keeps the output of an agent that finished without installing the SDK", async () => {
+    // Exit 0, the entry point edited, and `import traceroot` still failing: the
+    // install was step 2 of the task and something stopped it. Which something
+    // is in the output, and the feed was cleared the moment the agent finished,
+    // several checks before this one runs.
+    pythonRepo();
+    initGit();
+    const inner = fakeRunProcess({
+      gitStatus: ["", " M main.py"],
+      results: { claude: { output: "pip install traceroot: no write access to the cache\n" } },
+    });
+    const runProcess: SetupDeps["runProcess"] = async (o) =>
+      o.args[0] === "-c"
+        ? {
+            exitCode: 1,
+            output: "ModuleNotFoundError",
+            durationMs: 1,
+            timedOut: false,
+            spawnFailed: false,
+          }
+        : inner.run(o);
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess,
+      sdk: { package: "traceroot", version: "0.3.0", source: "registry" },
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error?.code).toBe("AGENT_FAILED");
+    expect(plain(result.error?.message ?? "")).toContain("was not installed");
+    expect(transcript()).toContain("no write access to the cache");
+    expect(plain(result.error?.remedy ?? "")).toContain(AGENT_OUTPUT_PATH);
+    // The install command is still the first instruction, not displaced by it.
+    expect(plain(result.error?.remedy ?? "")).toContain("traceroot==0.3.0");
   });
 
   it("never writes the application credential to disk", async () => {
