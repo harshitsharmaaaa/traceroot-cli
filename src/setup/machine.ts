@@ -34,7 +34,7 @@ import { DEFAULT_HOST } from "../commands/constants.js";
 import { loadOptionalEnvFileFromDisk } from "../config/envFile.js";
 import { writeConfig as realWriteConfig } from "../config/manager.js";
 import { type ResolvedAuth, normalizeApiKey } from "../config/resolve.js";
-import type { Writers } from "../output.js";
+import { ExitCode, type Writers } from "../output.js";
 import type { Prompt } from "../prompt.js";
 import { bundledSkillDir } from "../skills/bundled.js";
 import { installBundledSkill } from "../skills/install.js";
@@ -277,11 +277,20 @@ interface StageDefinition {
 
 /** Errors that mean "these credentials are wrong", as opposed to "the network is down". */
 function isAuthRejection(err: unknown): boolean {
-  // A real status beats sniffing a message. The regex below stays for the
-  // clients that only ever surface a string (`whoami`, transport errors), but
-  // anything that knows its status should be judged on it.
+  // A real status beats sniffing a message, and anything that knows its status
+  // should be judged on it.
   if (err instanceof SetupApiError) {
     return err.status === 401 || err.status === 403;
+  }
+  // So does the class the other clients assign. `whoami` throws the server's
+  // own `detail` as the message — "API key has expired", "Project has been
+  // deleted", "Authentication failed" — and the token provider refuses a dead
+  // session with "session expired or revoked", none of which the regex below
+  // recognises; both put the auth exit code on the error. Read structurally, as
+  // `trace.ts` does, with the text kept for errors that carry only a string.
+  const exitCode = (err as { exitCode?: unknown } | null | undefined)?.exitCode;
+  if (exitCode === ExitCode.auth) {
+    return true;
   }
   const message = err instanceof Error ? err.message : String(err);
   return /401|403|unauthor|invalid api key|forbidden/i.test(message);
@@ -904,7 +913,20 @@ async function userCredentialSignIn(
     });
   }
 
-  const chosen = await chooseProject(ctx, deps, api, projects, "authenticate", options.workspaceId);
+  // What the repository already reports to, if anything: read before the
+  // choice so it can be the default, and compared after it — before either key
+  // is minted — so a run that would move the repository asks first.
+  const existing = await repositoryKey(ctx, deps, host, "authenticate");
+  const chosen = await chooseProject(
+    ctx,
+    deps,
+    api,
+    projects,
+    "authenticate",
+    options.workspaceId,
+    existing?.who.project_id,
+  );
+  await confirmProjectSwitch(ctx, deps, existing, chosen.project, projects, "authenticate");
 
   // Two keys, because they go to two places with different rights.
   //
@@ -1183,6 +1205,23 @@ function describeWorkspace(project: ProjectSummary): string {
   return id === "" ? name : `${name} (${id})`;
 }
 
+/** A project as a reader can tell it from its namesakes: its name, then its workspace. */
+function describeProject(project: ProjectSummary): string {
+  return `'${project.project_name}' in ${describeWorkspace(project)}`;
+}
+
+/**
+ * Project name, then project id, compared by code unit.
+ *
+ * Not `localeCompare`: collation follows the runtime's locale data, and the
+ * point of the order is that a position names the same project on every
+ * machine that runs this, CI included.
+ */
+function byNameThenId(a: ProjectSummary, b: ProjectSummary): number {
+  const order = (x: string, y: string): number => (x < y ? -1 : x > y ? 1 : 0);
+  return order(a.project_name, b.project_name) || order(a.project_id, b.project_id);
+}
+
 /**
  * The project picker's rows.
  *
@@ -1217,20 +1256,33 @@ export function projectOptions(projects: readonly ProjectSummary[]): SelectOptio
  * only one, offer a choice when a human is present, and refuse to guess when
  * one is not. The `stage` parameter exists so the error blames the stage the
  * user is actually in.
+ *
+ * A repository that already reports to a project has already answered: that
+ * project is where the choice starts, and where a run with nobody to ask stays.
+ * Whether a different answer may replace it is {@link confirmProjectSwitch}'s
+ * call, not this function's.
  */
 async function chooseProject(
   ctx: SetupContext,
   deps: SetupDeps,
   api: SetupApi,
-  projects: readonly ProjectSummary[],
+  listed: readonly ProjectSummary[],
   stage: SetupStage,
   /** Where a newly created project goes, when the caller already knows. */
   workspaceId?: string,
+  /** The project the repository already reports to; see {@link repositoryKey}. */
+  currentProjectId?: string,
 ): Promise<{
   project: { projectId: string; projectName: string; workspaceId: string };
   origin: ProjectSelection["origin"];
 }> {
   const wanted = ctx.flags.project;
+  // In an order this function defines rather than the server's. The list
+  // endpoint leaves the projects inside a workspace unordered, so a row's
+  // position moved between runs, and "the third `test`" was not an answer that
+  // could be given twice.
+  const projects = [...listed].sort(byNameThenId);
+  const current = projects.find((p) => p.project_id === currentProjectId);
 
   const summarize = (p: ProjectSummary) => ({
     projectId: p.project_id,
@@ -1239,7 +1291,15 @@ async function chooseProject(
   });
 
   if (wanted !== undefined) {
-    const match = projects.find((p) => p.project_id === wanted || p.project_name === wanted);
+    // A name is unique only inside its workspace, so it can match several
+    // projects. Among them, the one the repository already reports to: the
+    // `--project` that set a repository up must not move it to a namesake on
+    // the next run.
+    const matches = projects.filter((p) => p.project_id === wanted || p.project_name === wanted);
+    const match =
+      matches.find((p) => p.project_id === wanted) ??
+      matches.find((p) => p === current) ??
+      matches[0];
     if (match === undefined) {
       throw new SetupError({
         stage,
@@ -1284,6 +1344,13 @@ async function chooseProject(
   }
 
   if (!ctx.canPrompt) {
+    if (current !== undefined) {
+      wizardProgress(
+        ctx,
+        `Using project ${describeProject(current)}, which this repository already reports to.`,
+      );
+      return { project: summarize(current), origin: "existing" };
+    }
     throw new SetupError({
       stage,
       code: "AMBIGUOUS",
@@ -1296,6 +1363,10 @@ async function chooseProject(
     stage,
     message: "Which project should receive these traces?",
     options: projectOptions(projects),
+    // Opens on the project the repository already reports to, so accepting the
+    // question as asked keeps it there. A first run has none and opens on the
+    // first row, as it always has.
+    ...(current === undefined ? {} : { initialValue: current.project_id }),
   });
   const picked = projects.find((p) => p.project_id === answer);
   if (picked === undefined) {
@@ -1306,6 +1377,93 @@ async function chooseProject(
     });
   }
   return { project: summarize(picked), origin: "existing" };
+}
+
+/**
+ * Refuses to move a repository to another project unless the user chose to.
+ *
+ * The refusal `reuseExistingKey` makes, on the path where it could never run. A
+ * user credential mints the application's key during authentication, so when
+ * the pipeline reaches `acquire_project_key` its `isSatisfied` is already true
+ * and the stage — the guard with it — is skipped, which left nothing between
+ * the picker and `configure_repository` replacing the env file's key with one
+ * for whichever project was picked. That is how three runs in one repository
+ * sent its traces to three projects. Asked here, between the choice and the
+ * first mint, so a refusal leaves nothing behind.
+ *
+ * A person is asked, with both projects named by workspace, because two
+ * projects can share a name. A run nobody is watching stops instead, unless
+ * `--project` named the destination: that is the user choosing it in this run,
+ * so the run goes ahead and says so.
+ */
+async function confirmProjectSwitch(
+  ctx: SetupContext,
+  deps: SetupDeps,
+  existing: RepositoryKey | null,
+  chosen: { projectId: string; projectName: string; workspaceId: string },
+  projects: readonly ProjectSummary[],
+  stage: SetupStage,
+): Promise<void> {
+  if (existing === null || existing.who.project_id === chosen.projectId) {
+    return;
+  }
+  const from = describeProject({
+    project_id: existing.who.project_id,
+    project_name: existing.who.project_name ?? existing.who.project_id,
+    workspace_id: existing.who.workspace_id,
+    workspace_name: existing.who.workspace_name,
+  });
+  const to = describeProject(
+    projects.find((p) => p.project_id === chosen.projectId) ?? {
+      project_id: chosen.projectId,
+      project_name: chosen.projectName,
+      workspace_id: chosen.workspaceId,
+    },
+  );
+
+  if (ctx.canPrompt) {
+    const answer = await deps.select({
+      stage,
+      message: `This repository sends its traces to ${from}. ${wizardEmphasis(`Switch it to ${to}?`)}`,
+      options: [
+        { value: "no", label: "No", hint: "keep it where it is and cancel setup" },
+        {
+          value: "yes",
+          label: "Yes",
+          hint: `send its traces to ${chosen.projectName} from now on`,
+        },
+      ],
+      initialValue: "no",
+    });
+    if (answer === "yes") {
+      return;
+    }
+    throw new SetupError({
+      stage,
+      code: "CANCELLED",
+      message: `Setup cancelled — this repository still sends its traces to ${from}.`,
+      remedy: "Rerun `traceroot setup` and accept the project it opens on.",
+    });
+  }
+
+  if (ctx.flags.project !== undefined) {
+    wizardWarn(
+      ctx,
+      `this repository sent its traces to ${from}; from now on it sends them to ${to}, as --project asked`,
+    );
+    return;
+  }
+
+  throw new SetupError({
+    stage,
+    code: "UNSAFE_OVERWRITE",
+    message: `${existing.envEntry} already contains a working TraceRoot key for ${from}, but setup selected ${to}.`,
+    remedy: [
+      "To move this repository to that project, name it:",
+      `  traceroot setup --project ${chosen.projectId}`,
+      `or remove ${KEY_ENV} from ${existing.envEntry} if it is stale.`,
+    ].join("\n"),
+  });
 }
 
 function recordProject(ctx: SetupContext): void {
@@ -1539,6 +1697,64 @@ async function mintRecordedKey(
   return created;
 }
 
+/** The key a repository's env file already holds, and who the server says it is. */
+interface RepositoryKey {
+  key: string;
+  /** The env file, named from the repository root. */
+  envEntry: string;
+  who: Awaited<ReturnType<ApiClient["whoami"]>>;
+}
+
+/**
+ * The key in the env file this run would write, and the project it belongs to —
+ * which is the project the repository already reports to.
+ *
+ * Asked of the server rather than recorded by setup. `whoami` answers for any
+ * project key, an ingest key included, so the key a previous run wrote is its
+ * own record of where the application's traces go; a second record under
+ * `.traceroot/` could only ever disagree with the key the application sends.
+ *
+ * Null when there is nothing to protect: no file, no key in it, or a key the
+ * server refuses. A key that could not be checked at all is not that —
+ * replacing it might break an application that works — so the run stops.
+ */
+async function repositoryKey(
+  ctx: SetupContext,
+  deps: SetupDeps,
+  host: string,
+  stage: SetupStage,
+): Promise<RepositoryKey | null> {
+  const envPath = credentialEnvPath(ctx);
+  const envEntry = relativeToRoot(ctx.root, envPath);
+  if (!existsSync(envPath)) {
+    return null;
+  }
+  const key = envFileKey(envPath)?.trim();
+  if (key === undefined || key === "") {
+    return null;
+  }
+
+  const client = deps.createClient({
+    host,
+    auth: { kind: "api-key", key },
+    timeoutMs: 15_000,
+  });
+  try {
+    return { key, envEntry, who: await client.whoami() };
+  } catch (err) {
+    if (isAuthRejection(err)) {
+      // A dead key is safe to replace.
+      return null;
+    }
+    throw new SetupError({
+      stage,
+      code: "UNSAFE_OVERWRITE",
+      message: `A TraceRoot key is already present in ${envEntry} but could not be verified (${host} was unreachable), so setup stopped rather than replacing it.`,
+      remedy: "Check your connection and rerun `traceroot setup`.",
+    });
+  }
+}
+
 /**
  * Looks for a key that already belongs to this repository and project.
  *
@@ -1552,37 +1768,11 @@ async function reuseExistingKey(
   deps: SetupDeps,
   projectId: string,
 ): Promise<ProjectCredential | null> {
-  const envPath = credentialEnvPath(ctx);
-  const envEntry = relativeToRoot(ctx.root, envPath);
-  if (!existsSync(envPath)) {
+  const existing = await repositoryKey(ctx, deps, requireSession(ctx).host, "acquire_project_key");
+  if (existing === null) {
     return null;
   }
-  const candidate = envFileKey(envPath);
-  if (candidate === undefined || candidate.trim() === "") {
-    return null;
-  }
-
-  const session = requireSession(ctx);
-  const client = deps.createClient({
-    host: session.host,
-    auth: { kind: "api-key", key: candidate.trim() },
-    timeoutMs: 15_000,
-  });
-  let who: Awaited<ReturnType<ApiClient["whoami"]>>;
-  try {
-    who = await client.whoami();
-  } catch (err) {
-    if (isAuthRejection(err)) {
-      // A dead key is safe to replace.
-      return null;
-    }
-    throw new SetupError({
-      stage: "acquire_project_key",
-      code: "UNSAFE_OVERWRITE",
-      message: `A TraceRoot key is already present in ${envEntry} but could not be verified (${session.host} was unreachable), so setup stopped rather than replacing it.`,
-      remedy: "Check your connection and rerun `traceroot setup`.",
-    });
-  }
+  const { who, envEntry } = existing;
 
   if (who.project_id !== projectId) {
     throw new SetupError({
@@ -1598,7 +1788,7 @@ async function reuseExistingKey(
   }
 
   return {
-    key: makeSecret(candidate.trim()),
+    key: makeSecret(existing.key),
     keyId: ctx.checkpoint.projectKeyId ?? null,
     keyName: who.key_name,
     projectId,

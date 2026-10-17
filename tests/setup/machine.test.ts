@@ -1197,6 +1197,512 @@ describe("the project picker's rows", () => {
   });
 });
 
+describe("a repository that already reports to a project", () => {
+  // Two projects named `test` in two workspaces: the ordinary shape of an
+  // account that belongs to more than one workspace, and the one the report
+  // came from.
+  const ALPHA = {
+    project_id: "p_a",
+    project_name: "alpha",
+    workspace_id: "w_1",
+    workspace_name: "Acme",
+  };
+  const TEST_ACME = {
+    project_id: "p_t1",
+    project_name: "test",
+    workspace_id: "w_1",
+    workspace_name: "Acme",
+  };
+  const TEST_GLOBEX = {
+    project_id: "p_t2",
+    project_name: "test",
+    workspace_id: "w_2",
+    workspace_name: "Globex",
+  };
+  /** A project in a workspace this account is not in, as a colleague's key's would be. */
+  const ELSEWHERE = {
+    project_id: "p_x",
+    project_name: "other",
+    workspace_id: "w_9",
+    workspace_name: "Initech",
+  };
+  type Project = typeof ALPHA;
+  const PROJECTS: readonly Project[] = [ALPHA, TEST_ACME, TEST_GLOBEX, ELSEWHERE];
+
+  /**
+   * The server's side of one or more runs: which project each key belongs to.
+   *
+   * Shared across runs, because the defect is about what one run leaves for the
+   * next — the key the first run mints is what the second finds in the env file
+   * and asks `whoami` about.
+   */
+  function server(...seeded: [key: string, project: Project][]) {
+    const owner = new Map<string, Project>(seeded);
+    /** Keys whose `whoami` fails in transit rather than being refused. */
+    const unreachable = new Set<string>();
+    /**
+     * Keys the server refuses, with its `detail`, and keys whose request never
+     * arrives — each thrown in the shape the real `whoami` client throws it.
+     */
+    const refused = new Map<string, string>();
+    const offline = new Set<string>();
+    let minted = 0;
+    return {
+      owner,
+      unreachable,
+      refused,
+      offline,
+      mint(projectId: string, name: string, scope: "ingest" | "admin" | undefined) {
+        minted += 1;
+        const key = `tr-${scope}-${projectId}-${minted}`;
+        const project = PROJECTS.find((p) => p.project_id === projectId);
+        if (project !== undefined) {
+          owner.set(key, project);
+        }
+        return {
+          id: `ak_${minted}`,
+          name,
+          hint: `tr-hint-${minted}`,
+          project_id: projectId,
+          scope: scope ?? "ingest",
+          expires_at: null,
+          key,
+        };
+      },
+      /** The project the key now in the repository's `.env` belongs to. */
+      reportsTo(): string | undefined {
+        const path = join(dir, ".env");
+        if (!existsSync(path)) {
+          return undefined;
+        }
+        const key = /^TRACEROOT_API_KEY=(.*)$/m.exec(readFileSync(path, "utf8"))?.[1];
+        return key === undefined ? undefined : owner.get(key)?.project_id;
+      },
+    };
+  }
+
+  /** One `traceroot setup` on a saved sign-in, recording what it asked and called. */
+  function setupRun(
+    world: ReturnType<typeof server>,
+    options: {
+      listed: readonly Project[];
+      answers?: string[];
+      canPrompt?: boolean;
+      flags?: Partial<SetupFlags>;
+    },
+  ) {
+    const asked: Parameters<SetupDeps["select"]>[0][] = [];
+    const calls: string[] = [];
+    const configured: string[] = [];
+    const base = makeDeps({
+      auth: authEmpty(),
+      setupApi: fakeSetupApi({
+        listProjects: async () => {
+          calls.push("listProjects");
+          return options.listed.map((p) => ({ ...p }));
+        },
+        createProjectApiKey: async (input) => {
+          calls.push(`mint ${input.scope} ${input.projectId}`);
+          return world.mint(input.projectId, input.name, input.scope);
+        },
+      }),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
+      answers: options.answers ?? [],
+      storedCredential: { session_token: "saved-session-token" },
+      onWriteConfig: (config) => configured.push(config.api_key),
+    });
+    const deps: SetupDeps = {
+      ...base,
+      // `whoami` answers for the key it is asked about, as the real one does:
+      // with the project that key was minted into.
+      createClient: (opts) => {
+        const key = opts.auth.kind === "api-key" ? opts.auth.key : "";
+        calls.push(`whoami ${key}`);
+        return fakeApiClient({
+          whoamiResult: async () => {
+            // The real client's two shapes: the server's `detail` with the auth
+            // exit code for a refusal, and the network code for a request that
+            // never arrived (`api/client.ts` `failFor` and `rawGet`).
+            const detail = world.refused.get(key);
+            if (detail !== undefined) {
+              throw new CliError(detail, ExitCode.auth);
+            }
+            if (world.offline.has(key)) {
+              throw new CliError(`request to ${opts.host} failed: fetch failed`, ExitCode.network);
+            }
+            if (world.unreachable.has(key)) {
+              throw new SetupApiError("fetch failed", 0);
+            }
+            const project = world.owner.get(key);
+            if (project === undefined) {
+              throw new SetupApiError("Invalid API key", 401);
+            }
+            return whoami({ ...project });
+          },
+          traces: [traceRow()],
+        });
+      },
+      select: (input) => {
+        asked.push(input);
+        return base.select(input);
+      },
+    };
+    const harness = makeCtx({
+      canPrompt: options.canPrompt ?? true,
+      flags: { agent: "claude", ...options.flags },
+    });
+    return { ...harness, deps, asked, calls, configured };
+  }
+
+  const projectQuestion = (asked: Parameters<SetupDeps["select"]>[0][]) =>
+    asked.find((input) => input.message.includes("Which project"));
+
+  it("leaves a first run exactly as it was", async () => {
+    // Nothing changes until the repository already holds a key: no `whoami` on
+    // an env file that is not there, no starting row, no second question.
+    pythonRepo();
+    const world = server();
+    const first = setupRun(world, { listed: [ALPHA, TEST_ACME, TEST_GLOBEX], answers: ["3"] });
+
+    const result = await runSetupMachine(first.ctx, first.deps);
+
+    expect(result.ok).toBe(true);
+    const atSignIn = first.asked.filter((input) => input.stage === "authenticate");
+    expect(atSignIn).toEqual([
+      {
+        stage: "authenticate",
+        message: "Which project should receive these traces?",
+        options: [
+          { value: "p_a", label: "alpha", hint: "Acme (w_1)" },
+          { value: "p_t1", label: "test", hint: "Acme (w_1)" },
+          { value: "p_t2", label: "test", hint: "Globex (w_2)" },
+        ],
+      },
+    ]);
+    expect(atSignIn[0]).not.toHaveProperty("initialValue");
+    // The same calls in the same order. The one `whoami` verifies the CLI's
+    // own freshly minted key; no key was read out of an env file.
+    expect(first.calls).toEqual([
+      "listProjects",
+      "mint admin p_t2",
+      "mint ingest p_t2",
+      "whoami tr-admin-p_t2-1",
+    ]);
+    expect(first.configured).toEqual(["tr-admin-p_t2-1"]);
+    expect(world.reportsTo()).toBe("p_t2");
+    const said = plain(first.err.data);
+    expect(said).toContain("Project test.");
+    expect(said).not.toContain("already reports to");
+    expect(said).not.toContain("Switch");
+  });
+
+  it("keeps three runs in one repository on one project", async () => {
+    // The report: three identical runs, three projects. The server orders the
+    // projects inside a workspace by nothing, so each run gets them in another
+    // order — and after the first pick, each run accepts the question as asked.
+    pythonRepo();
+    const world = server();
+    const runs: [listed: Project[], answers: string[]][] = [
+      [[TEST_GLOBEX, ALPHA, TEST_ACME], ["p_t2"]],
+      [[TEST_ACME, TEST_GLOBEX, ALPHA], [""]],
+      [[ALPHA, TEST_ACME, TEST_GLOBEX], [""]],
+    ];
+    const landed: (string | undefined)[] = [];
+    const startedOn: (string | undefined)[] = [];
+
+    for (const [listed, answers] of runs) {
+      const each = setupRun(world, { listed, answers });
+      const result = await runSetupMachine(each.ctx, each.deps);
+      expect(result.error).toBeNull();
+      startedOn.push(projectQuestion(each.asked)?.initialValue);
+      landed.push(world.reportsTo());
+    }
+
+    expect(landed).toEqual(["p_t2", "p_t2", "p_t2"]);
+    // Each rerun opened on the project the repository already reports to.
+    expect(startedOn).toEqual([undefined, "p_t2", "p_t2"]);
+  });
+
+  it("gives the same answer the same project whatever order the server lists them in", async () => {
+    pythonRepo();
+    const rows: string[][] = [];
+    const picked: (string | undefined)[] = [];
+
+    for (const listed of [
+      [TEST_GLOBEX, ALPHA, TEST_ACME],
+      [TEST_ACME, TEST_GLOBEX, ALPHA],
+    ]) {
+      rmSync(join(dir, ".env"), { force: true });
+      const each = setupRun(server(), { listed, answers: ["3"] });
+      const result = await runSetupMachine(each.ctx, each.deps);
+      expect(result.error).toBeNull();
+      rows.push(projectQuestion(each.asked)?.options.map((o) => o.value) ?? []);
+      picked.push(each.ctx.project?.projectId);
+    }
+
+    // By name, then id: the two `test`s keep their places relative to each other.
+    expect(rows).toEqual([
+      ["p_a", "p_t1", "p_t2"],
+      ["p_a", "p_t1", "p_t2"],
+    ]);
+    expect(picked).toEqual(["p_t2", "p_t2"]);
+  });
+
+  it("starts a rerun that cannot ask on the project the repository reports to, and says so", async () => {
+    // Before, a run with several projects and nobody to ask refused outright —
+    // with the answer already on disk.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-previous-key\n");
+    const world = server(["tr-previous-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [ALPHA, TEST_ACME, TEST_GLOBEX], canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(each.ctx.project?.projectId).toBe("p_t2");
+    expect(world.reportsTo()).toBe("p_t2");
+    expect(plain(each.err.data)).toContain(
+      "Using project 'test' in Globex (w_2), which this repository already reports to.",
+    );
+  });
+
+  it("asks before moving the repository to another project, naming both", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-previous-key\n");
+    const world = server(["tr-previous-key", TEST_GLOBEX]);
+    // The other `test`: the mis-pick that identical labels made undetectable.
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      answers: ["p_t1", "yes"],
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    const question = each.asked.find((input) => input.message.includes("Switch it to"));
+    const message = plain(question?.message ?? "");
+    expect(message).toContain("'test' in Globex (w_2)");
+    expect(message).toContain("'test' in Acme (w_1)");
+    // Staying is the default; moving is the answer that has to be given.
+    expect(question?.initialValue).toBe("no");
+    expect(world.reportsTo()).toBe("p_t1");
+  });
+
+  it("leaves the repository where it was when the move is declined", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-previous-key\n");
+    const world = server(["tr-previous-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      answers: ["p_t1", ""],
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("CANCELLED");
+    expect(each.calls.filter((call) => call.startsWith("mint"))).toEqual([]);
+    expect(each.configured).toEqual([]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe("TRACEROOT_API_KEY=tr-previous-key\n");
+  });
+
+  it("stops a run that cannot ask before it gives the repository another project's key", async () => {
+    // A key for a project this account cannot reach, and one project it can:
+    // the run takes that one without asking, which is a move nobody chose. It
+    // has to stop before anything is minted or written.
+    pythonRepo();
+    const before = "# the project's own\nTRACEROOT_API_KEY=tr-colleague-key\nDEBUG=1\n";
+    writeFileSync(join(dir, ".env"), before);
+    const world = server(["tr-colleague-key", ELSEWHERE]);
+    const each = setupRun(world, { listed: [ALPHA], canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("UNSAFE_OVERWRITE");
+    expect(result.error?.exitCode).toBe(SETUP_EXIT_CODES.UNSAFE_OVERWRITE);
+    expect(result.error?.message).toContain("'other' in Initech (w_9)");
+    expect(result.error?.message).toContain("'alpha' in Acme (w_1)");
+    expect(result.error?.remedy).toContain("traceroot setup --project p_a");
+    expect(each.calls.filter((call) => call.startsWith("mint"))).toEqual([]);
+    expect(each.configured).toEqual([]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
+  });
+
+  it("still moves the repository when --project names another project, and says so", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-previous-key\n");
+    const world = server(["tr-previous-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      canPrompt: false,
+      flags: { project: "alpha" },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(world.reportsTo()).toBe("p_a");
+    expect(plain(each.err.data)).toContain(
+      "this repository sent its traces to 'test' in Globex (w_2); from now on it sends them to 'alpha' in Acme (w_1), as --project asked",
+    );
+  });
+
+  it("reads a --project name that several projects share as the one the repository reports to", async () => {
+    // Otherwise the same `--project test` that set the repository up could
+    // move it to the other `test` on the next run.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-previous-key\n");
+    const world = server(["tr-previous-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      canPrompt: false,
+      flags: { project: "test" },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(world.reportsTo()).toBe("p_t2");
+    expect(plain(each.err.data)).not.toContain("as --project asked");
+  });
+
+  it("replaces a key the server no longer accepts without asking", async () => {
+    // A dead key sends traces nowhere, so there is nothing to keep.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-revoked-key\n");
+    const world = server();
+    const each = setupRun(world, { listed: [ALPHA, TEST_ACME], answers: ["p_t1"] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(
+      each.asked.filter((input) => input.stage === "authenticate").map((input) => input.message),
+    ).toEqual(["Which project should receive these traces?"]);
+    expect(world.reportsTo()).toBe("p_t1");
+  });
+
+  it("stops rather than replace a key it could not check", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-unverified-key\n");
+    const world = server();
+    world.unreachable.add("tr-unverified-key");
+    const each = setupRun(world, { listed: [ALPHA, TEST_ACME], answers: ["p_t1"] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("UNSAFE_OVERWRITE");
+    expect(each.calls.filter((call) => call.startsWith("mint"))).toEqual([]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe("TRACEROOT_API_KEY=tr-unverified-key\n");
+  });
+
+  // What the server actually says about a key that has died. None of it reads
+  // as a refusal to a pattern over the text, so each one used to stop a
+  // logged-in rerun with "unreachable" instead of replacing the dead key.
+  for (const detail of [
+    "API key has expired",
+    "Project has been deleted",
+    "Authentication failed",
+  ]) {
+    it(`replaces a key the server refuses with "${detail}" without asking`, async () => {
+      pythonRepo();
+      writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-dead-key\n");
+      const world = server();
+      world.refused.set("tr-dead-key", detail);
+      const each = setupRun(world, { listed: [ALPHA, TEST_ACME], answers: ["p_t1"] });
+
+      const result = await runSetupMachine(each.ctx, each.deps);
+
+      expect(result.error).toBeNull();
+      expect(
+        each.asked.filter((input) => input.stage === "authenticate").map((input) => input.message),
+      ).toEqual(["Which project should receive these traces?"]);
+      expect(world.reportsTo()).toBe("p_t1");
+    });
+  }
+
+  it("still stops when the request to check the key never arrived", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-unverified-key\n");
+    const world = server();
+    world.offline.add("tr-unverified-key");
+    const each = setupRun(world, { listed: [ALPHA, TEST_ACME], answers: ["p_t1"] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("UNSAFE_OVERWRITE");
+    expect(result.error?.message).toContain("was unreachable");
+    expect(each.calls.filter((call) => call.startsWith("mint"))).toEqual([]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe("TRACEROOT_API_KEY=tr-unverified-key\n");
+  });
+
+  it("signs in again over a configured key that has expired, rather than calling the host unreachable", async () => {
+    pythonRepo();
+    const world = server();
+    world.refused.set("tr-expired-config-key", "API key has expired");
+    const each = setupRun(world, { listed: [ALPHA] });
+    const deps: SetupDeps = { ...each.deps, resolvedAuth: authWithKey("tr-expired-config-key") };
+
+    const result = await runSetupMachine(each.ctx, deps);
+
+    expect(result.error).toBeNull();
+    expect(plain(each.err.data)).toContain(
+      "the existing TraceRoot credential was rejected; signing in again",
+    );
+    // The saved sign-in took over from the dead key.
+    expect(each.ctx.session?.via).toBe("user-credential");
+  });
+
+  it("goes back to the browser when the saved sign-in itself has expired", async () => {
+    // The token provider refuses a dead session before any request goes out,
+    // in its own words and with the auth exit code (`auth/token.ts`), so the
+    // first call that needs a token is where it surfaces.
+    pythonRepo();
+    const world = server();
+    const each = setupRun(world, { listed: [ALPHA], flags: { browser: true } });
+    const cleared: string[] = [];
+    const deps: SetupDeps = {
+      ...each.deps,
+      createTokenProvider: (opts) =>
+        opts.sessionToken === "saved-session-token"
+          ? {
+              getAccessToken: async () => {
+                throw new CliError(
+                  "session expired or revoked — run `traceroot login` to sign in again",
+                  ExitCode.auth,
+                );
+              },
+              invalidate: () => undefined,
+            }
+          : each.deps.createTokenProvider(opts),
+      // Asks for a token before every request, as the real setup client does.
+      createSetupApi: (opts) => {
+        const inner = each.deps.createSetupApi(opts);
+        return {
+          ...inner,
+          listProjects: async (workspaceId) => {
+            await opts.tokenProvider?.getAccessToken();
+            return inner.listProjects(workspaceId);
+          },
+        };
+      },
+      deleteCredential: (host) => {
+        cleared.push(host);
+        return true;
+      },
+    };
+
+    const result = await runSetupMachine(each.ctx, deps);
+
+    expect(result.error).toBeNull();
+    expect(cleared).toEqual(["https://api.example.test"]);
+    expect(plain(each.err.data)).toContain(
+      "the saved TraceRoot sign-in has expired; signing in again",
+    );
+    expect(each.ctx.session?.via).toBe("user-credential");
+  });
+});
+
 describe("project credential", () => {
   it("reuses a valid key already in the project's .env rather than minting another", async () => {
     pythonRepo();
