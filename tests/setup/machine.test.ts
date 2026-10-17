@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 /** `git status --porcelain -z` record separator. */
 const NUL = String.fromCharCode(0);
+import type { ApiClientOptions } from "../../src/api/client.js";
 import { BackendUnavailableError, SetupApiError } from "../../src/api/setup.js";
 import type { CredentialEntry } from "../../src/auth/credentials.js";
 import { openBrowserForPlatform } from "../../src/auth/deviceFlow.js";
@@ -1066,6 +1067,8 @@ describe("the handoff code from browser-first onboarding", () => {
     auth?: ResolvedAuth;
     deviceToken?: string;
     flags?: Partial<SetupFlags>;
+    /** Makes the configured API key fail verification, as a dead key does. */
+    rejectKey?: boolean;
   }
 
   /**
@@ -1078,11 +1081,24 @@ describe("the handoff code from browser-first onboarding", () => {
     const written: CredentialEntry[] = [];
     const minted: string[] = [];
     const redeemed: Array<{ authHost: string; code: string }> = [];
+    const keysUsed: string[] = [];
     let deviceFlows = 0;
+    const client = fakeApiClient({
+      whoamiResult: async () => {
+        // Only the *configured* key is dead. The project key this run mints is
+        // verified through `whoami` too, and rejecting that would fail the run
+        // for a reason this test is not about.
+        if (options.rejectKey === true && keysUsed.at(-1) === "tr-explicit-key") {
+          throw new SetupApiError("Invalid API key", 401);
+        }
+        return whoami();
+      },
+      traces: [traceRow()],
+    });
     const deps = makeDeps({
       auth: options.auth ?? authEmpty(),
       setupApi: projectApi(),
-      client: fakeApiClient({ traces: [traceRow()] }),
+      client,
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       storedCredential: options.stored ?? null,
       onWriteCredential: (_host, entry) => written.push(entry),
@@ -1106,6 +1122,14 @@ describe("the handoff code from browser-first onboarding", () => {
       minted.push(opts.sessionToken);
       return { getAccessToken: async () => "access-jwt-value", invalidate: () => undefined };
     };
+    // Which API key the run actually authenticates with. `whoami` alone cannot
+    // answer that: the project-key mint verifies its new key the same way.
+    deps.createClient = (opts: ApiClientOptions) => {
+      if (opts.auth.kind === "api-key") {
+        keysUsed.push(opts.auth.key);
+      }
+      return client;
+    };
     const harness = makeCtx({
       canPrompt: true,
       flags: { browser: true, agent: "claude", handoff: CODE, ...options.flags },
@@ -1116,7 +1140,28 @@ describe("the handoff code from browser-first onboarding", () => {
       written,
       minted,
       redeemed,
+      keysUsed,
       deviceFlows: () => deviceFlows,
+    };
+  }
+
+  /** Resolved auth holding an API key the user never asked this run to use. */
+  function ambientKey(source: "config" | "auto-env-file"): ResolvedAuth {
+    return {
+      credential: { kind: "api-key", value: "tr-stale-ambient-key", source },
+      hostUrl: { value: "https://api.example.test", source: "config" },
+      authHost: { value: "https://api.example.test", source: "default" },
+      projectId: { value: undefined, source: "none" },
+    };
+  }
+
+  /** Resolved auth holding an API key the user named on purpose. */
+  function explicitKey(source: "flag" | "env" | "env-file"): ResolvedAuth {
+    return {
+      credential: { kind: "api-key", value: "tr-explicit-key", source },
+      hostUrl: { value: "https://api.example.test", source: "config" },
+      authHost: { value: "https://api.example.test", source: "default" },
+      projectId: { value: undefined, source: "none" },
     };
   }
 
@@ -1289,6 +1334,87 @@ describe("the handoff code from browser-first onboarding", () => {
     expect(run.redeemed).toEqual([{ authHost: "http://localhost:3000", code: CODE }]);
     // The credential remembers the split, exactly as the browser path's does.
     expect(run.written[0]?.auth_host).toBe("http://localhost:3000");
+  });
+
+  it("beats a stale API key left in this directory's .env, and says it did", async () => {
+    // The failure this feature exists to remove. `setup` writes
+    // `TRACEROOT_API_KEY` into the working directory's `.env` when it succeeds,
+    // and the hand-back step tells the user to run it where the application
+    // lives — so the likeliest place to paste a handoff command already holds
+    // a key, very possibly for a different account.
+    const run = handoffRun({ auth: ambientKey("auto-env-file") });
+    const result = await runSetupMachine(run.ctx, run.deps);
+
+    expect(result.ok).toBe(true);
+    // The key was never even verified, let alone used…
+    expect(run.keysUsed).not.toContain("tr-stale-ambient-key");
+    // …the code was redeemed, and the run authenticated as its account.
+    expect(run.redeemed).toEqual([{ authHost: "https://api.example.test", code: CODE }]);
+    expect(run.minted).toEqual(["handoff-session-token"]);
+    expect(run.written.map((e) => e.email)).toEqual(["bob@new.example"]);
+    const text = said(run.err.data);
+    expect(text).toContain(
+      "A TraceRoot API key is configured in this directory's .env; the sign-in code from the browser takes precedence.",
+    );
+    expect(text).toContain("Signed in as bob@new.example.");
+  });
+
+  it("beats an API key left in the config file, and names that file instead", async () => {
+    const run = handoffRun({ auth: ambientKey("config") });
+    const result = await runSetupMachine(run.ctx, run.deps);
+
+    expect(result.ok).toBe(true);
+    expect(run.keysUsed).not.toContain("tr-stale-ambient-key");
+    expect(run.minted).toEqual(["handoff-session-token"]);
+    expect(said(run.err.data)).toContain(
+      "A TraceRoot API key is configured in your TraceRoot config file; the sign-in code from the browser takes precedence.",
+    );
+  });
+
+  it("loses to an API key the user named on this command line", async () => {
+    // Ambient state must not defeat an explicit flag; one explicit instruction
+    // beating another is a different thing, and the user gets to mean it.
+    for (const source of ["flag", "env", "env-file"] as const) {
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      const run = handoffRun({ auth: explicitKey(source) });
+      const result = await runSetupMachine(run.ctx, run.deps);
+
+      expect(result.ok, `${source} key signs the run in`).toBe(true);
+      expect(run.keysUsed, `${source} key is the credential used`).toContain("tr-explicit-key");
+      expect(run.redeemed, `${source} key leaves the code unspent`).toEqual([]);
+      expect(said(run.err.data), `${source} key says nothing about precedence`).not.toContain(
+        "takes precedence",
+      );
+    }
+  });
+
+  it("falls back to the handoff when an explicit key is rejected", async () => {
+    // `whoami` is the configured-key path's own check, and this is it failing.
+    const run = handoffRun({ auth: explicitKey("flag"), rejectKey: true });
+    const result = await runSetupMachine(run.ctx, run.deps);
+
+    expect(result.ok).toBe(true);
+    expect(run.redeemed).toHaveLength(1);
+    expect(run.minted).toEqual(["handoff-session-token"]);
+  });
+
+  it("uses the ambient key after all when the code turns out to be spent", async () => {
+    // "As if the flag had not been passed": the code had its turn, announced
+    // itself dead, and the ordinary ladder resumes from the top.
+    const run = handoffRun({
+      auth: ambientKey("auto-env-file"),
+      redeem: async () => ({ kind: "rejected" }),
+    });
+    const result = await runSetupMachine(run.ctx, run.deps);
+
+    expect(result.ok).toBe(true);
+    expect(run.deviceFlows()).toBe(0);
+    expect(run.keysUsed).toContain("tr-stale-ambient-key");
+    const text = said(run.err.data);
+    expect(text).toContain("takes precedence");
+    expect(text).toContain("the sign-in code from the browser is no longer valid");
+    expect(text).toContain("Signed in with the TraceRoot credential already configured.");
   });
 });
 

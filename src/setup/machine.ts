@@ -450,12 +450,74 @@ function apiKeyFrom(auth: SetupDeps["resolvedAuth"]): string | undefined {
   return auth.credential.kind === "api-key" ? auth.credential.value : undefined;
 }
 
+/**
+ * The line that says an ambient API key was set aside for a handoff code.
+ *
+ * Named by where it came from, because "a key is configured" is not actionable
+ * when the reader cannot see *which* key — and the two places differ in how
+ * surprising they are: a `.env` belongs to the repository the user is standing
+ * in, the config file belongs to the machine.
+ */
+function ambientKeySetAside(source: ResolvedAuth["credential"]["source"]): string {
+  const where =
+    source === "auto-env-file" ? "in this directory's .env" : "in your TraceRoot config file";
+  return `A TraceRoot API key is configured ${where}; the sign-in code from the browser takes precedence.`;
+}
+
 const authenticate: StageDefinition = {
   stage: "authenticate",
   isSatisfied: (ctx) => ctx.session !== undefined,
   async run(ctx, deps) {
     const host = deps.resolvedAuth.hostUrl.value ?? DEFAULT_HOST;
     const existing = apiKeyFrom(deps.resolvedAuth);
+
+    // Browser-first onboarding's one-shot code. It is redeemed at most once per
+    // run, from whichever of the two rungs below is reached first.
+    const handoffCode = ctx.flags.handoff?.trim();
+    const handoff = handoffCode === undefined || handoffCode === "" ? null : handoffCode;
+    let handoffTried = false;
+    const tryHandoff = async (): Promise<boolean> => {
+      if (handoff === null || handoffTried) {
+        return false;
+      }
+      handoffTried = true;
+      return await handoffSignIn(ctx, deps, host, handoff);
+    };
+
+    // Where the code sits relative to a configured API key — the one real
+    // precedence question this feature poses.
+    //
+    // An `--api-key` typed on this command line, named through `--env-file`, or
+    // exported in the environment is a deliberate instruction, and it keeps
+    // winning. An *ambient* key does not. One left in this directory's `.env`
+    // or in the config file by an earlier run is machine state, not intent, and
+    // letting it quietly defeat a code typed on the command line is the exact
+    // failure this feature exists to remove: the hand-back step says to run
+    // setup where the application lives, and a successful run writes
+    // `TRACEROOT_API_KEY` into that directory's `.env` — so the likeliest place
+    // to paste a handoff command is a directory already holding a key for some
+    // other account. Honouring it silently authenticates as that account and
+    // then dies three stages later, at project selection, with a message about
+    // a missing project rather than about the wrong account.
+    //
+    // The explicit/ambient line is `isExplicitSource`'s, not a second one
+    // invented here.
+    const keyIsAmbient =
+      existing !== undefined &&
+      existing !== "" &&
+      !isExplicitSource(deps.resolvedAuth.credential.source);
+    if (handoff !== null && keyIsAmbient) {
+      // Said before the redemption, not after: this is the decision, and it
+      // holds whether or not the code turns out to still be live.
+      wizardNote(ctx.writers, [ambientKeySetAside(deps.resolvedAuth.credential.source)], {
+        settled: true,
+      });
+      if (await tryHandoff()) {
+        return "ok";
+      }
+      // The code was refused, so the flag has had its say and the ordinary
+      // ladder resumes — ambient key included.
+    }
 
     if (existing !== undefined && existing !== "") {
       const client = deps.createClient({
@@ -520,20 +582,19 @@ const authenticate: StageDefinition = {
       }
     }
 
-    // Browser-first onboarding's one-shot code, redeemed before anything saved
-    // on disk is consulted. It is explicit intent to authenticate as the
-    // account whose browser printed the command, and the `--project` on that
-    // same line belongs to *that* account — so reusing a stored session would
-    // not merely be the wrong account, it would fail later and elsewhere, as a
-    // confusing project error rather than an auth one.
-    const handoffCode = ctx.flags.handoff?.trim();
-    if (handoffCode !== undefined && handoffCode !== "") {
-      if (await handoffSignIn(ctx, deps, host, handoffCode)) {
-        return "ok";
-      }
-      // Refused. Fall through to the rungs below exactly as if the flag had
-      // not been passed: interactive and nothing stored means the device flow,
-      // which is one extra page and the status quo — never a dead end.
+    // The code's other rung, reached when no key was configured at all or when
+    // an explicit one was rejected. Either way it runs before anything saved on
+    // disk is consulted: the code is intent to authenticate as the account
+    // whose browser printed the command, and the `--project` on that same line
+    // belongs to *that* account, so reusing a stored session would not merely
+    // be the wrong account — it would fail later and elsewhere, as a confusing
+    // project error rather than an auth one.
+    //
+    // A refusal falls through to the rungs below exactly as if the flag had not
+    // been passed: interactive and nothing stored means the device flow, which
+    // is one extra page and the status quo — never a dead end.
+    if (await tryHandoff()) {
+      return "ok";
     }
 
     // A stored credential means this user already signed in on this machine, so
