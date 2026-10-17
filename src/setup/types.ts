@@ -238,17 +238,21 @@ export interface SetupCheckpoint {
   service?: { path: string; language: StackLanguage; framework: string | null };
   sdkVersion?: string;
   /**
-   * How the instrument stage handed the task over, when it changed no code.
+   * How the instrument stage completed: an agent ran, or the task was handed
+   * over and nothing was edited.
    *
    * On the checkpoint because the next invocation cannot re-derive it. A
    * hand-over leaves the repository exactly as it found it, so `--resume`
    * restores the stage rather than re-running it — and a restored result that
    * claimed an agent had edited the code is what sent a resumed run off to wait
-   * for a trace from an application with no TraceRoot in it. Absent means an
-   * agent ran: the mode this records is the one the stage cannot observe
-   * afterwards.
+   * for a trace from an application with no TraceRoot in it.
+   *
+   * Every route writes its own value, `"agent"` included, so absence means one
+   * thing only: a checkpoint from a version that did not record this. That is
+   * not evidence of an agent run, and the instrument stage declines to restore
+   * rather than assume one — the assumption is the bug.
    */
-  instrumentHandover?: "task-file" | "manual";
+  instrumentHandover?: "agent" | "task-file" | "manual";
   application?: ApplicationVerification;
   /**
    * The project's own check as it stood before this run instrumented anything.

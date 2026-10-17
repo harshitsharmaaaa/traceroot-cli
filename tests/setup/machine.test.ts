@@ -2658,6 +2658,11 @@ describe("resume and rerun", () => {
       previous.completedStages.push(stage);
     }
     previous.lastError = { stage: "verify_trace", code: "TRACE_TIMEOUT", message: "no trace" };
+    // What that previous run would have recorded: it instrumented, so an agent
+    // edited this worktree. The field is how the resumed run knows not to send
+    // one over it again, so a fixture standing in for such a run has to carry
+    // it.
+    previous.instrumentHandover = "agent";
     writeCheckpoint(dir, previous);
 
     const process = fakeRunProcess({ gitStatus: ["", " M main.py"] });
@@ -3558,6 +3563,31 @@ describe("the agent a hand-over targets", () => {
     expect(skillInstalled(codexHome, "skills")).toBe(true);
   });
 
+  it("does not offer the generic fallback it created itself", async () => {
+    // `.agents/` is where a hand-over with nothing to name puts the skill, so
+    // from the second run onwards the repository has one. Counted as an agent
+    // that is "set up here", it raises a second question — the one
+    // `chooseInstrumentation` exists to avoid — between a real agent and a
+    // category, and answering "Agent (generic)" is then met with "no coding
+    // agent is set up here".
+    pythonRepo();
+    withClaudeConfigured();
+    mkdirSync(join(dir, ".agents"), { recursive: true });
+    const { deps, asked } = askRecorder(handoverDeps(["generic"]));
+    const { ctx, err } = makeCtx({
+      canPrompt: true,
+      flags: { instrument: false, traceTimeoutSec: 1 },
+    });
+
+    await runSetupMachine(ctx, deps);
+
+    expect(asked.filter((q) => q.message.includes("Which coding agent"))).toEqual([]);
+    expect(ctx.agent?.id).toBe("claude");
+    const said = plain(err.data);
+    expect(said).toContain("Run it in Claude Code");
+    expect(said).not.toContain("Agent (generic)");
+  });
+
   it("never asks when it cannot, and says what it picked and how to change it", async () => {
     // A `--json` consumer and a CI job have nobody to answer a question, and
     // stdout there belongs to the event stream — so the choice is reported
@@ -3589,7 +3619,7 @@ describe("the agent a hand-over targets", () => {
     withClaudeConfigured();
     withCodexConfigured();
     const { deps, asked } = askRecorder(handoverDeps());
-    const { ctx, out } = makeCtx({
+    const { ctx, out, err } = makeCtx({
       json: true,
       flags: { instrument: false, traceTimeoutSec: 1 },
     });
@@ -3598,9 +3628,13 @@ describe("the agent a hand-over targets", () => {
 
     expect(asked).toEqual([]);
     // stdout belongs to the event stream; the note about what was targeted is
-    // stderr, like every other thing the run says about itself.
+    // stderr, like every other thing the run says about itself. Both halves
+    // asserted: "not on stdout" alone passes just as well if the note is never
+    // printed at all, which would lose the only account of what was picked.
     expect(plain(out.data)).not.toContain("Which coding agent");
     expect(plain(out.data)).not.toContain("Agents set up here");
+    expect(plain(err.data)).toContain("Agents set up here: Claude Code, Codex");
+    expect(plain(err.data)).toContain("Targeting Claude Code");
     expect(ctx.agent?.id).toBe("claude");
   });
 
@@ -3681,6 +3715,9 @@ describe("why no trace arrived", () => {
     expect(message).toContain("this service is not instrumented");
     expect(message).toContain(".traceroot/prompts/setup-instrument.md");
     expect(message).not.toContain("nothing has run your application");
+    // Named, not pronouned: the clause before it is the task file's path, so
+    // "no initialization in it" reads as a complaint about the task file.
+    expect(message).toContain("no TraceRoot initialization in the service");
     // And the remedy is the one the wizard printed a few lines earlier.
     const remedy = plain(result.error?.remedy ?? "");
     expect(remedy).toContain(".traceroot/prompts/setup-instrument.md");
@@ -3777,6 +3814,37 @@ describe("why no trace arrived", () => {
     expect(message).toContain(".traceroot/prompts/setup-instrument.md");
     expect(message).not.toContain("nothing has run your application");
     expect(plain(err.data)).not.toContain("Waiting for your first trace");
+  });
+
+  it("does not read a checkpoint that predates the field as an agent run", async () => {
+    // The upgrade case. A checkpoint written by a version that had the
+    // hand-over routes but not the field recording which one it took carries no
+    // value here, and absence must not be read as "an agent ran" — read that
+    // way it restores a result claiming the code was edited, which is the
+    // misdiagnosis above, back again and silent. There is nothing to restore
+    // it from, so the stage runs instead and records what it did this time.
+    pythonRepoWithoutTests();
+    const first = makeCtx({ flags: { instrument: false, traceTimeoutSec: 120 } });
+    await runSetupMachine(first.ctx, traceless());
+
+    // The checkpoint such a version would have left: everything else it knows,
+    // and no answer to this.
+    const legacy = readCheckpoint(dir);
+    if (legacy !== null) {
+      legacy.instrumentHandover = undefined;
+    }
+
+    const { ctx } = makeCtx({
+      flags: { instrument: false, traceTimeoutSec: 120, resume: true },
+      resumeFrom: legacy ?? undefined,
+    });
+    const result = await runSetupMachine(ctx, traceless());
+
+    expect(ctx.instrumentation?.mode).toBe("prompt-only");
+    expect(ctx.checkpoint.instrumentHandover).toBe("task-file");
+    const message = plain(result.error?.message ?? "");
+    expect(message).toContain("this service is not instrumented");
+    expect(message).not.toContain("nothing has run your application");
   });
 });
 

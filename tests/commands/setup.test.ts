@@ -42,12 +42,29 @@ import {
 } from "../setup/helpers.js";
 
 let dir: string;
+let prevCodexHome: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "tr-setup-cmd-"));
+  // Codex's skills directory is global, not project-local: it is read from
+  // `$CODEX_HOME`, falling back to the real `~/.codex`. This file drives the
+  // whole of `runSetup`, and the hand-over route reaches `detectConfiguredAgents`
+  // and then installs the skill wherever the chosen adapter points — so a test
+  // here that does not pass `agent: "claude"` would write into the home
+  // directory of whoever is running the suite. That has happened once already,
+  // and it had to be undone by hand. Pointed at the fixture, the same way
+  // `machine`, `doctor` and `skills` already do.
+  prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = join(dir, "codex-home");
 });
 
 afterEach(() => {
+  if (prevCodexHome === undefined) {
+    // biome-ignore lint/performance/noDelete: restoring an env var; assigning undefined would stringify it
+    delete process.env.CODEX_HOME;
+  } else {
+    process.env.CODEX_HOME = prevCodexHome;
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 

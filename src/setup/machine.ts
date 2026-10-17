@@ -2429,15 +2429,24 @@ const instrument: StageDefinition = {
     // the user to go and run it again. The mode is the thing `verify_trace`
     // reads to say so instead, so it has to survive the invocation that
     // recorded it.
-    const handover = ctx.checkpoint.instrumentHandover;
+    const completed = ctx.checkpoint.instrumentHandover;
+    if (completed === undefined) {
+      // A checkpoint written before that field existed. Every route records its
+      // own value now, so absence is "not recorded" and nothing else — and
+      // defaulting it to the agent route is the misreading this whole fix is
+      // about, except silent. Decline, and the stage runs again: a rerun
+      // without `--resume` already does exactly that, so it is a path the flow
+      // has, where a restored result built on a guess is not.
+      return;
+    }
     ctx.instrumentation = {
       agentId,
-      mode: handover === undefined ? "background" : "prompt-only",
+      mode: completed === "agent" ? "background" : "prompt-only",
       exitCode: 0,
       durationMs: 0,
       reported: null,
       observedChangedFiles: [],
-      promptPath: handover === "task-file" ? instrumentTaskPath(ctx.root) : null,
+      promptPath: completed === "task-file" ? instrumentTaskPath(ctx.root) : null,
     };
   },
   async run(ctx, deps) {
@@ -2761,9 +2770,12 @@ const instrument: StageDefinition = {
       }
 
       const reported = parseCompletion(result.output);
-      // An agent did run, so a hand-over an earlier run recorded here no longer
-      // describes this repository.
-      ctx.checkpoint.instrumentHandover = undefined;
+      // An agent did run. Recorded positively rather than by clearing the
+      // field, because a rerun without `--resume` still loads the previous
+      // checkpoint: writing `"agent"` overwrites a hand-over an earlier run
+      // recorded here, which is what the clear was for, and leaves absence
+      // meaning only "a version that did not record this".
+      ctx.checkpoint.instrumentHandover = "agent";
       ctx.instrumentation = {
         agentId: agent.id,
         mode: "background",
@@ -3253,7 +3265,11 @@ const verifyTrace: StageDefinition = {
           task === null
             ? "setup printed the manual instructions and changed no code itself,"
             : `setup wrote the instrumentation task to ${task} and changed no code itself,`,
-          "and there is no TraceRoot initialization in it yet.",
+          // "in the service", not "in it": the clause before this one names the
+          // task file, so a pronoun here binds to that and the sentence ends up
+          // reporting that the task file holds no initialization — true, beside
+          // the point, and the opposite of what the reader needs to know.
+          "and there is no TraceRoot initialization in the service yet.",
           "An uninstrumented application emits nothing, however often it runs.",
         ].join(" "),
         remedy:

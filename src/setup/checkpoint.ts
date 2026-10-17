@@ -125,9 +125,15 @@ export function readCheckpoint(root: string): SetupCheckpoint | null {
   ] as const) {
     copyString(key);
   }
-  // A closed set of two spellings, so a corrupt or hand-edited value cannot
-  // make a resumed run believe its code was never instrumented.
-  if (obj.instrumentHandover === "task-file" || obj.instrumentHandover === "manual") {
+  // A closed set of three spellings, and its own guard rather than
+  // `copyString`, which would take any string into a three-branch union: an
+  // unrecognised value has to read as absent, so that a corrupt or hand-edited
+  // file cannot make a resumed run believe its code was never instrumented.
+  if (
+    obj.instrumentHandover === "agent" ||
+    obj.instrumentHandover === "task-file" ||
+    obj.instrumentHandover === "manual"
+  ) {
     checkpoint.instrumentHandover = obj.instrumentHandover;
   }
   // Validated per shape rather than "is an object": adopting these unchecked let a

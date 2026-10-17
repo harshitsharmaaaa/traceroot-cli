@@ -259,7 +259,14 @@ export async function selectAgent(input: SelectAgentInput): Promise<DetectedAgen
  * one: Codex reports `$CODEX_HOME` in the home directory while Claude Code
  * reports a project-local `.claude`, and collapsing the two would install the
  * skill where that agent will never look for it.
+ *
+ * `generic` is excluded. It is the fallback for "no particular agent", so there
+ * is nowhere to send a user who picks it — and its `detect` answers for
+ * `.agents/`, the directory this very route creates when it falls back to it.
+ * Left in, every repository that has taken a generic hand-over once is asked
+ * from then on to choose between a real agent and a category, and the run that
+ * answers "Agent (generic)" then says no coding agent is set up here.
  */
 export function detectConfiguredAgents(cwd: string): AgentAdapter[] {
-  return ALL_AGENTS.filter((adapter) => adapter.detect(cwd).present);
+  return ALL_AGENTS.filter((adapter) => adapter.id !== "generic" && adapter.detect(cwd).present);
 }
