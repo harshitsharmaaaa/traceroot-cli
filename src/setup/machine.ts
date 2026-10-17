@@ -453,31 +453,17 @@ const authenticate: StageDefinition = {
       });
       try {
         const who = await client.whoami();
-        ctx.session = {
-          host: who.host === "" ? host : host,
-          uiBaseUrl: who.ui_base_url,
-          userKey: makeSecret(existing),
-          workspaceId: who.workspace_id,
-          workspaceName: who.workspace_name,
-          via: isExplicitSource(deps.resolvedAuth.credential.source)
+        adoptKeySession(
+          ctx,
+          host,
+          existing,
+          who,
+          isExplicitSource(deps.resolvedAuth.credential.source)
             ? deps.resolvedAuth.credential.source === "flag"
               ? "flag"
               : "env"
             : "existing-config",
-        };
-        // The key already implies a project (TraceRoot keys are project-scoped
-        // today), so record it as the default selection. SELECT_CONTEXT may
-        // still override it from `--project`.
-        ctx.project = {
-          projectId: who.project_id,
-          projectName: who.project_name ?? who.project_id,
-          workspaceId: who.workspace_id,
-          origin: "from-whoami",
-        };
-        ctx.checkpoint.host = host;
-        ctx.checkpoint.uiBaseUrl = who.ui_base_url;
-        ctx.checkpoint.workspaceId = who.workspace_id;
-        recordProject(ctx);
+        );
         // Every way into this stage now opens with its own sentence, because
         // the generic "Sign in to TraceRoot" heading is gone. Without one this
         // path — the fastest of the four — would pass in silence, and a step
@@ -581,27 +567,49 @@ const authenticate: StageDefinition = {
     });
     const who = await client.whoami();
     deps.writeConfig({ api_key: pasted, host_url: host });
-    ctx.session = {
-      host,
-      uiBaseUrl: who.ui_base_url,
-      userKey: makeSecret(pasted),
-      workspaceId: who.workspace_id,
-      workspaceName: who.workspace_name,
-      via: "pasted-key",
-    };
-    ctx.project = {
-      projectId: who.project_id,
-      projectName: who.project_name ?? who.project_id,
-      workspaceId: who.workspace_id,
-      origin: "from-whoami",
-    };
-    ctx.checkpoint.host = host;
-    ctx.checkpoint.uiBaseUrl = who.ui_base_url;
-    ctx.checkpoint.workspaceId = who.workspace_id;
-    recordProject(ctx);
+    adoptKeySession(ctx, host, pasted, who, "pasted-key");
     return "ok";
   },
 };
+
+/**
+ * Adopts an API key that `whoami` has just accepted as this run's session.
+ *
+ * One function for the two routes that sign in with a key — one already
+ * configured, one pasted at the prompt — because what a key session records
+ * does not depend on where the key came from, and a second copy is a second
+ * place a field can reach one route and not the other.
+ *
+ * The key already implies a project (TraceRoot keys are project-scoped today),
+ * so it is recorded as the default selection. SELECT_CONTEXT may still override
+ * it from `--project`.
+ */
+function adoptKeySession(
+  ctx: SetupContext,
+  host: string,
+  key: string,
+  who: Awaited<ReturnType<ApiClient["whoami"]>>,
+  via: NonNullable<SetupContext["session"]>["via"],
+): void {
+  ctx.session = {
+    host,
+    uiBaseUrl: who.ui_base_url,
+    userKey: makeSecret(key),
+    workspaceId: who.workspace_id,
+    workspaceName: who.workspace_name,
+    via,
+  };
+  ctx.project = {
+    projectId: who.project_id,
+    projectName: who.project_name ?? who.project_id,
+    workspaceId: who.workspace_id,
+    origin: "from-whoami",
+  };
+  ctx.checkpoint.host = host;
+  ctx.checkpoint.uiBaseUrl = who.ui_base_url;
+  ctx.checkpoint.workspaceId = who.workspace_id;
+  recordProject(ctx);
+}
 
 /** Hosts checked when the default deployment turns out not to support setup. */
 const LOCAL_HOST_CANDIDATES = ["http://localhost:8000", "http://localhost:3000"];
@@ -1806,19 +1814,6 @@ async function warnIfNotIgnored(ctx: SetupContext, deps: SetupDeps, entry: strin
 }
 
 /**
- * The credential file, named relative to a directory, or null when there is
- * none on disk.
- *
- * Asked of the filesystem rather than of what this run did, because both
- * answers have to be right and only one of them is about this run.
- * `configure_repository` writes nothing when the file already holds the right
- * value, writes nothing when the file is tracked by git, and does not run at
- * all when the key already resolves from the user's own config — and in two of
- * those three the file is there and should be loaded. Pointing an entry point
- * at a file that is absent, meanwhile, trades a missing credential for an
- * exception on startup, so the check is the file itself.
- */
-/**
  * The key an env file holds, or undefined when the file cannot be read at all.
  *
  * `loadOptionalEnvFileFromDisk` swallows a missing file and rethrows
@@ -1836,6 +1831,19 @@ function envFileKey(path: string): string | undefined {
   }
 }
 
+/**
+ * The credential file, named relative to a directory, or null when there is
+ * none on disk.
+ *
+ * Asked of the filesystem rather than of what this run did, because both
+ * answers have to be right and only one of them is about this run.
+ * `configure_repository` writes nothing when the file already holds the right
+ * value, writes nothing when the file is tracked by git, and does not run at
+ * all when the key already resolves from the user's own config — and in two of
+ * those three the file is there and should be loaded. Pointing an entry point
+ * at a file that is absent, meanwhile, trades a missing credential for an
+ * exception on startup, so the check is the file itself.
+ */
 function credentialEnvFile(ctx: SetupContext, from: string): string | null {
   const path = credentialEnvPath(ctx);
   // Existing is not enough: `configure_repository` also writes nothing when git
@@ -1885,20 +1893,18 @@ const detectStackStage: StageDefinition = {
     ctx.stack = stack;
 
     if (stack.selected === null) {
-      if (stack.services.length === 0) {
-        // No dependency manifest anywhere. Detection deliberately does not
-        // infer a service from loose scripts — a stray file is not evidence —
-        // but the answer to "no manifest" is to ask, listing what is actually
-        // there, not to stop with a suggestion the user cannot act on, since
-        // following that suggestion would only reproduce this very error.
-        return await askForLanguage(ctx, deps, stack);
-      }
-      // More than one candidate. Choosing silently would produce a confident,
+      // Both ways of selecting nothing are answered by the same question.
+      //
+      // No dependency manifest anywhere: detection deliberately does not infer
+      // a service from loose scripts — a stray file is not evidence — but the
+      // answer to "no manifest" is to ask, not to stop with a suggestion the
+      // user cannot act on, since following that suggestion would only
+      // reproduce this very error.
+      //
+      // More than one candidate: choosing silently would produce a confident,
       // wrong success — an instrumented service nobody asked about, and no
       // traces from the one they cared about. So ask when we can, and only
-      // refuse when there is nobody to ask.
-
-      // More than one candidate. Ask which *language* here and leave the
+      // refuse when there is nobody to ask. Ask which *language*, and leave the
       // service to the agent: choosing between directories is the part the
       // agent does better.
       return await askForLanguage(ctx, deps, stack);
@@ -1924,17 +1930,6 @@ const detectStackStage: StageDefinition = {
   },
 };
 
-/**
- * No manifest anywhere: ask which directory to instrument, listing what is
- * there.
- *
- * Nothing is inferred from loose hints: the candidate services, paths and
- * languages that were found are listed, and the user picks exactly one.
- * Detection stays dumb; the question is where the intelligence goes.
- *
- * Nothing here selects anything on the user's behalf — a directory is only ever
- * offered, and instrumenting it requires them to name it.
- */
 /**
  * Ask which language to instrument, and let the coding agent settle which
  * service.
