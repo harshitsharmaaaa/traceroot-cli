@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { displaySkillPath, requireAgent } from "../agents/index.js";
 import type { AgentAdapter } from "../agents/types.js";
 import { type ApiClient, type ApiClientOptions, createApiClient } from "../api/client.js";
@@ -2402,6 +2402,17 @@ function oneLine(note: string, max = 200): string {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
+/**
+ * Where the task-file route writes the instrumentation task.
+ *
+ * Named once because two invocations have to agree on it: the run that writes
+ * the file, and the `--resume` that restores the hand-over and has to name that
+ * file again without having written it.
+ */
+function instrumentTaskPath(root: string): string {
+  return join(root, ".traceroot", "prompts", "setup-instrument.md");
+}
+
 const instrument: StageDefinition = {
   stage: "instrument",
   isSatisfied: (ctx) => ctx.instrumentation !== undefined,
@@ -2412,14 +2423,21 @@ const instrument: StageDefinition = {
     if (agentId === undefined) {
       return;
     }
+    // Unless nothing was edited at all. A hand-over is the other way this stage
+    // completes, and restoring one as an agent run is how a resumed run came to
+    // wait out the trace timeout on an uninstrumented application and then tell
+    // the user to go and run it again. The mode is the thing `verify_trace`
+    // reads to say so instead, so it has to survive the invocation that
+    // recorded it.
+    const handover = ctx.checkpoint.instrumentHandover;
     ctx.instrumentation = {
       agentId,
-      mode: "background",
+      mode: handover === undefined ? "background" : "prompt-only",
       exitCode: 0,
       durationMs: 0,
       reported: null,
       observedChangedFiles: [],
-      promptPath: null,
+      promptPath: handover === "task-file" ? instrumentTaskPath(ctx.root) : null,
     };
   },
   async run(ctx, deps) {
@@ -2511,6 +2529,7 @@ const instrument: StageDefinition = {
         skillPath: displaySkillPath(ctx.root, adapter.getSkillInstallPath(ctx.root, SKILL_NAME)),
       });
       wizardLine(ctx, `\n${instructions}`);
+      ctx.checkpoint.instrumentHandover = "manual";
       ctx.instrumentation = {
         agentId: agent.id,
         mode: "prompt-only",
@@ -2527,10 +2546,11 @@ const instrument: StageDefinition = {
       // The task is handed over instead of run. The rest of the flow still
       // works, so "instrument it yourself, then `setup --resume`" is a
       // first-class path rather than a dead end.
-      const promptPath = join(ctx.root, ".traceroot", "prompts", "setup-instrument.md");
+      const promptPath = instrumentTaskPath(ctx.root);
       const { mkdirSync, writeFileSync } = await import("node:fs");
-      mkdirSync(join(ctx.root, ".traceroot", "prompts"), { recursive: true });
+      mkdirSync(dirname(promptPath), { recursive: true });
       writeFileSync(promptPath, task, "utf8");
+      ctx.checkpoint.instrumentHandover = "task-file";
       ctx.instrumentation = {
         agentId: agent.id,
         mode: "prompt-only",
@@ -2741,6 +2761,9 @@ const instrument: StageDefinition = {
       }
 
       const reported = parseCompletion(result.output);
+      // An agent did run, so a hand-over an earlier run recorded here no longer
+      // describes this repository.
+      ctx.checkpoint.instrumentHandover = undefined;
       ctx.instrumentation = {
         agentId: agent.id,
         mode: "background",

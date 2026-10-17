@@ -125,6 +125,11 @@ export function readCheckpoint(root: string): SetupCheckpoint | null {
   ] as const) {
     copyString(key);
   }
+  // A closed set of two spellings, so a corrupt or hand-edited value cannot
+  // make a resumed run believe its code was never instrumented.
+  if (obj.instrumentHandover === "task-file" || obj.instrumentHandover === "manual") {
+    checkpoint.instrumentHandover = obj.instrumentHandover;
+  }
   // Validated per shape rather than "is an object": adopting these unchecked let a
   // corrupt or hand-edited file satisfy `verify_application`, or report a trace
   // that was never seen, on a resumed run.

@@ -237,6 +237,18 @@ export interface SetupCheckpoint {
   agentId?: AgentId;
   service?: { path: string; language: StackLanguage; framework: string | null };
   sdkVersion?: string;
+  /**
+   * How the instrument stage handed the task over, when it changed no code.
+   *
+   * On the checkpoint because the next invocation cannot re-derive it. A
+   * hand-over leaves the repository exactly as it found it, so `--resume`
+   * restores the stage rather than re-running it — and a restored result that
+   * claimed an agent had edited the code is what sent a resumed run off to wait
+   * for a trace from an application with no TraceRoot in it. Absent means an
+   * agent ran: the mode this records is the one the stage cannot observe
+   * afterwards.
+   */
+  instrumentHandover?: "task-file" | "manual";
   application?: ApplicationVerification;
   /**
    * The project's own check as it stood before this run instrumented anything.

@@ -3752,6 +3752,32 @@ describe("why no trace arrived", () => {
     expect(message).toContain("nothing has run your application");
     expect(message).not.toContain("this service is not instrumented");
   });
+
+  it("says it again on the resume, where the user actually reads it", async () => {
+    // The route a user is on: the first run writes the task and tells them to
+    // rerun with `--resume`, so the resumed run is where this diagnosis has to
+    // land. `--resume` restores the instrument stage from the checkpoint rather
+    // than running it again — and a restored hand-over that claimed an agent
+    // had edited the code is what sent them back to run an application with no
+    // TraceRoot in it, which is the loop this whole route exists to break.
+    pythonRepoWithoutTests();
+    const first = makeCtx({ flags: { instrument: false, traceTimeoutSec: 120 } });
+    await runSetupMachine(first.ctx, traceless());
+
+    const { ctx, err } = makeCtx({
+      flags: { instrument: false, traceTimeoutSec: 120, resume: true },
+      resumeFrom: readCheckpoint(dir) ?? undefined,
+    });
+    const result = await runSetupMachine(ctx, traceless());
+
+    // Restored as what it was, not as an agent run.
+    expect(ctx.instrumentation?.mode).toBe("prompt-only");
+    const message = plain(result.error?.message ?? "");
+    expect(message).toContain("this service is not instrumented");
+    expect(message).toContain(".traceroot/prompts/setup-instrument.md");
+    expect(message).not.toContain("nothing has run your application");
+    expect(plain(err.data)).not.toContain("Waiting for your first trace");
+  });
 });
 
 describe("JSON mode", () => {
