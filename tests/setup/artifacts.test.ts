@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -214,5 +222,19 @@ describe("the `.gitignore` that covers setup's own files", () => {
 
   it("does nothing, rather than throwing, when the directory is not there", () => {
     expect(() => ensureGitignore(join(root, "gone", ".traceroot"))).not.toThrow();
+  });
+
+  it("writes through no symlink planted at the path", () => {
+    // `existsSync` answers about the target, so a `.gitignore` symlinked
+    // somewhere else reads as absent — and a plain write would follow it and
+    // create that file with our content.
+    const dir = join(root, ".traceroot");
+    mkdirSync(dir, { recursive: true });
+    const elsewhere = join(root, "elsewhere.txt");
+    symlinkSync(elsewhere, join(dir, ".gitignore"));
+
+    expect(() => ensureGitignore(dir)).not.toThrow();
+
+    expect(existsSync(elsewhere)).toBe(false);
   });
 });

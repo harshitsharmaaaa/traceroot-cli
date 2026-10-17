@@ -2711,6 +2711,11 @@ function keepAgentOutput(input: {
     ? []
     : [
         `What ${input.adapter.displayName} printed is in ${path} — the only record of what it tried, including anything it was refused.`,
+        // Said here rather than only in `transcript.ts`, because this is the
+        // line read by the person deciding whether to send the file to us. The
+        // application credential is scrubbed out of it twice; anything else the
+        // agent read out of the repository is in there verbatim.
+        "It quotes what the agent read from the repository, so read it before you attach it to anything.",
       ];
 }
 
