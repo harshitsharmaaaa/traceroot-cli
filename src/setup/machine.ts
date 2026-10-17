@@ -71,7 +71,12 @@ import {
 import { type Secret, makeSecret } from "./secret.js";
 import { type SelectFn, type SelectOption, interactiveSelect } from "./select.js";
 import { startLineSpinner } from "./spinner.js";
-import { detectStack, normalizeLanguage } from "./stack.js";
+import {
+  detectStack,
+  findTraceRootInitialization,
+  normalizeLanguage,
+  serviceEntryPath,
+} from "./stack.js";
 import { buildSetupTask, manualInstructions, parseCompletion, taskInterpreters } from "./task.js";
 import { isThinTrace, pollForTrace, spanPhrase, thinTraceFinding } from "./trace.js";
 import { discardTypeAhead } from "./tty.js";
@@ -3017,6 +3022,64 @@ const instrument: StageDefinition = {
             "  traceroot setup --no-instrument",
           ].join("\n"),
         });
+      }
+
+      // Exit 0, and the service still has no TraceRoot in it.
+      //
+      // The guard above cannot fire without the agent's own report, so an agent
+      // that finishes without emitting one is not covered by it at all — which
+      // is what the run that prompted this did. No completion block, the SDK
+      // installed into `.venv`, not one line of `main.py` touched, the stage
+      // recorded as done, `verify_application` passing on untouched code, and
+      // then two minutes of trace spinner before the failure blamed the
+      // instrumented path for never running. Every one of those was true and
+      // none of them was the answer, which had been available the moment the
+      // agent exited.
+      //
+      // So this asks the question rather than inferring it from how many files
+      // moved: {@link findTraceRootInitialization} is the reading
+      // `detect_stack` makes for `existingInstrumentation`, re-run now that the
+      // agent has finished. It reads files, not a diff, so it holds in a
+      // repository that is not under git — where `observedChangedFiles` is
+      // empty whatever happened, and the inference above is therefore blind.
+      //
+      // Both ways the agent can be right are allowed for. It is not required to
+      // have edited the entry point: whatever it reported changing and whatever
+      // git saw change are read too, because a call wired into a module the
+      // entry point imports is instrumentation. And a service that already
+      // carried TraceRoot is excluded, for the same reason it is excluded
+      // above — there the right amount of editing may genuinely be none.
+      //
+      // Only ever a positive finding of absence. An entry point that could not
+      // be identified is not evidence of anything, so there the stage says
+      // nothing and the run carries on.
+      const entryPoint = serviceEntryPath(service);
+      if (ctx.stack?.existingInstrumentation.present !== true && entryPoint !== null) {
+        const wiredIn = findTraceRootInitialization(ctx.root, service, [
+          ...(reported?.filesChanged ?? []),
+          ...observedChangedFiles,
+        ]);
+        if (wiredIn === null) {
+          throw new PausedSetupError({
+            stage: "instrument",
+            code: "AGENT_FAILED",
+            message: [
+              `${adapter.displayName} finished, but the service is still not instrumented: there is no TraceRoot initialization in ${entryPoint}.`,
+              reported === null || reported.notes === null
+                ? null
+                : `It reported: ${oneLine(reported.notes)}`,
+            ]
+              .filter((part) => part !== null)
+              .join(" "),
+            remedy: [
+              "Exit 0 is the agent saying it finished, not that it wired anything up — a refused command and an exhausted context both end that way.",
+              "Nothing was reverted, so a rerun picks up from whatever it did get done:",
+              "  traceroot setup --resume",
+              "Or write the task out and run it yourself:",
+              "  traceroot setup --no-instrument",
+            ].join("\n"),
+          });
+        }
       }
 
       const sdkCheck = await checkSdkImportable(ctx, deps, service, sdk, agentCwd);
