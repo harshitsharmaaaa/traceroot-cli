@@ -598,7 +598,13 @@ export function findTraceRootInitialization(
       continue;
     }
     candidates.push({ display: file, path: join(root, file) });
-    candidates.push({ display: file, path: join(dir, file) });
+    // The second resolution only when it is a second file. A root service's
+    // directory *is* the repository root, so pushing both reads every reported
+    // file twice — and walks a reported directory twice, under a file budget
+    // that is meant to be one.
+    if (dir !== root) {
+      candidates.push({ display: file, path: join(dir, file) });
+    }
   }
 
   for (const candidate of expandDirectories(
@@ -648,6 +654,15 @@ const SOURCE_EXTENSIONS = [".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
  */
 const MAX_DIRECTORY_FILES = 64;
 const MAX_DIRECTORY_DEPTH = 2;
+
+/** Whether the path is a directory — absent or unreadable is not. */
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 /** Source files beneath `dir`, as paths relative to it. */
 function sourceFilesUnder(dir: string, depth = 0): string[] {
@@ -706,21 +721,11 @@ function expandDirectories(
 ): Array<{ display: string; path: string }> {
   const expanded: Array<{ display: string; path: string }> = [];
   for (const candidate of candidates) {
-    // Before the walk, not after it: `node_modules/` and `dist/` arrive here
-    // like any other untracked directory, and the loop below drops them on
-    // sight. Expanding one first would readdir a dependency tree to reach the
-    // same answer.
-    if (isBuildArtifact(candidate.display)) {
-      expanded.push(candidate);
-      continue;
-    }
-    let isDirectory = false;
-    try {
-      isDirectory = statSync(candidate.path).isDirectory();
-    } catch {
-      isDirectory = false;
-    }
-    if (!isDirectory) {
+    // The artifact test is first and short-circuits the stat: `node_modules/`
+    // and `dist/` arrive here like any other untracked directory, and the loop
+    // that reads these drops them on sight, so expanding one would readdir a
+    // dependency tree to reach an answer already known.
+    if (isBuildArtifact(candidate.display) || !isDirectory(candidate.path)) {
       expanded.push(candidate);
       continue;
     }
