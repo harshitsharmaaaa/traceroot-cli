@@ -1,6 +1,7 @@
 import { join, relative, sep } from "node:path";
 import { writeFileSecure } from "../util/secureFile.js";
 import { applicationEnvKeys } from "./envWrite.js";
+import { nameList } from "./production.js";
 import { isThinTrace, spanPhrase, thinTraceFinding } from "./trace.js";
 import type { ApplicationKeyLocation, SetupContext } from "./types.js";
 
@@ -51,12 +52,13 @@ export function slashPath(path: string, separator: string = sep): string {
  * the default host the application needs `TRACEROOT_HOST_URL` as well, and a
  * report that named the key alone would reproduce exactly the omission that
  * silently sends a self-hosted user's traces to the wrong instance.
+ *
+ * Joined by {@link nameList}, the same helper the closing notice and the
+ * closing sentence use, so the one rule this phrase follows — names in a
+ * sentence, no Oxford comma — is stated once rather than reproduced here.
  */
 function productionKeys(host: string | undefined): string {
-  const names = applicationEnvKeys(host).map((name) => `\`${name}\``);
-  return names.length === 1
-    ? (names[0] ?? "")
-    : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return nameList(applicationEnvKeys(host).map((name) => `\`${name}\``));
 }
 
 function line(label: string, value: string | null | undefined): string {
