@@ -1,7 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { Command } from "commander";
+import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { type Command, CommanderError } from "commander";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildProgram } from "../../src/cli.js";
 import { runDoctor } from "../../src/commands/doctor.js";
@@ -150,6 +154,118 @@ describe("setup command registration", () => {
     expect(flags).not.toContain("--yolo");
     expect(flags).not.toContain("--agent-cmd");
   });
+
+  it("refuses a stray operand at the parse, before any action runs", async () => {
+    // `traceroot setup doctr` used to run the whole wizard: commander 12 allows
+    // excess arguments by default, so the typo reached `setup`'s own action as
+    // an ignored operand. Both actions are swapped for recorders, and what is
+    // asserted is that neither was entered — every effect setup has (the mint,
+    // the env write, the agent launch) happens inside one, and the wizard is not
+    // even loaded until the action runs. `doctor` takes no operand either, and
+    // inherits the rule from `setup` rather than declaring it.
+    for (const argv of [
+      ["setup", "doctr"],
+      ["setup", "doctor", "api"],
+    ]) {
+      const program = buildProgram();
+      const setup = program.commands.find((c) => c.name() === "setup");
+      const doctor = setup?.commands.find((c) => c.name() === "doctor");
+      expect(doctor).toBeDefined();
+      let entered = 0;
+      setup?.action(() => {
+        entered += 1;
+      });
+      doctor?.action(() => {
+        entered += 1;
+      });
+
+      let thrown: unknown;
+      try {
+        await program.parseAsync(["node", "traceroot", ...argv]);
+      } catch (err) {
+        thrown = err;
+      }
+
+      const named = `\`${argv.join(" ")}\``;
+      expect(thrown, named).toBeInstanceOf(CommanderError);
+      expect((thrown as CommanderError).code, named).toBe("commander.excessArguments");
+      expect(entered, named).toBe(0);
+    }
+  });
+
+  // The shim is a shell script, so not on Windows.
+  it.skipIf(process.platform === "win32")(
+    "exits 2 on the typo having called, launched and written nothing (spawned)",
+    async () => {
+      // The exit code is decided in `run()`, so it can only be read from a real
+      // process. Each effect the wizard has gets a recorder, so its absence is
+      // observed rather than inferred: the credential points at a local server
+      // that counts requests (a key is minted over the API, after the key in
+      // hand has been checked there); a `git` shim first on PATH logs a launch
+      // (in a repository, `git` is the first program the wizard runs); and the
+      // directory is where the checkpoint, the env file and the agent's task
+      // file would land.
+      mkdirSync(join(dir, ".git"), { recursive: true });
+      const requests: string[] = [];
+      const server = createServer((req, res) => {
+        requests.push(`${req.method} ${req.url}`);
+        res.writeHead(401).end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const shims = mkdtempSync(join(tmpdir(), "tr-setup-shims-"));
+      const launches = join(shims, "launches.log");
+      writeFileSync(join(shims, "git"), `#!/bin/sh\necho "git $*" >> '${launches}'\nexit 1\n`, {
+        mode: 0o755,
+      });
+
+      try {
+        const { port } = server.address() as AddressInfo;
+        const bin = fileURLToPath(new URL("../../bin/traceroot.mjs", import.meta.url));
+        const child = spawn(process.execPath, [bin, "setup", "doctr"], {
+          cwd: dir,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            CI: "true",
+            PATH: `${shims}${delimiter}${process.env.PATH ?? ""}`,
+            TRACEROOT_CONFIG_PATH: join(dir, "no-such-config", "config.json"),
+            TRACEROOT_CREDENTIALS_PATH: join(dir, "no-such-creds", "credentials.json"),
+            TRACEROOT_API_KEY: "tr-not-a-real-key",
+            TRACEROOT_HOST_URL: `http://127.0.0.1:${port}`,
+            TRACEROOT_TOKEN: "",
+            TRACEROOT_AUTH_URL: "",
+            TRACEROOT_PROJECT_ID: "",
+          },
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+        });
+        const status = await new Promise<number | null>((resolve, reject) => {
+          child.on("error", reject);
+          child.on("close", resolve);
+        });
+
+        expect(status).toBe(ExitCode.usage);
+        expect(stdout).toBe("");
+        const said = plain(stderr);
+        expect(said).toContain("too many arguments");
+        // The frame's first line: with the operand ignored the wizard opened,
+        // printed this, and went on to do the rest of it.
+        expect(said).not.toContain(WIZARD_TITLE);
+        expect(requests).toEqual([]);
+        expect(existsSync(launches)).toBe(false);
+        expect(readdirSync(dir, { recursive: true })).toEqual([".git"]);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+        rmSync(shims, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("the line that closes the wizard", () => {

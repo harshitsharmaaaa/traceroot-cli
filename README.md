@@ -20,7 +20,7 @@ coding agent, and waits for the first trace to arrive:
 npx -y traceroot-cli@latest setup
 ```
 
-Already instrumented, and here to read your data:
+Already instrumented? The rest of the CLI:
 
 ```sh
 traceroot login                       # sign in with your browser (device flow)
