@@ -26,13 +26,14 @@ import { SETUP_EXIT_CODES } from "../../src/setup/errors.js";
 import { type SetupEvent, jsonEmitter } from "../../src/setup/events.js";
 import type { SetupDeps } from "../../src/setup/machine.js";
 import {
+  SETUP_PIPELINE,
   defaultSetupDeps,
   projectOptions,
   runSetupMachine,
   uniqueKeyName,
 } from "../../src/setup/machine.js";
 import { makeSecret } from "../../src/setup/secret.js";
-import type { SetupContext, SetupFlags } from "../../src/setup/types.js";
+import { SETUP_STAGES, type SetupContext, type SetupFlags } from "../../src/setup/types.js";
 import { wizardEmphasis } from "../../src/setup/wizard.js";
 import { sleep } from "../../src/util/sleep.js";
 import type { StringSink } from "../helpers/stringSink.js";
@@ -1415,6 +1416,16 @@ describe("the handoff code from browser-first onboarding", () => {
     expect(text).toContain("takes precedence");
     expect(text).toContain("the sign-in code from the browser is no longer valid");
     expect(text).toContain("Signed in with the TraceRoot credential already configured.");
+  });
+
+  it("redeems the code before any coding agent could read it", () => {
+    // A handoff code is live until it is redeemed, and `instrument` hands a
+    // coding agent a shell in the user's repository — one that can read shell
+    // history and run `ps`. That the code is already spent by then is a
+    // property of stage ORDER, which a later reshuffle could quietly break.
+    const order = SETUP_PIPELINE.map((definition) => definition.stage);
+    expect(order).toEqual([...SETUP_STAGES]);
+    expect(order.indexOf("authenticate")).toBeLessThan(order.indexOf("instrument"));
   });
 });
 
