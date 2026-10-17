@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { removeEnvContent } from "./envWrite.js";
-import { type RunProcess, splitCommand } from "./exec.js";
+import { type RunProcess, type RunProcessResult, splitCommand } from "./exec.js";
 import { withVenvOnPath } from "./python.js";
 import type { Secret } from "./secret.js";
 import type { ApplicationVerification, VerificationRun } from "./types.js";
@@ -267,6 +267,21 @@ function unpark(entry: Parked | null): void {
   }
 }
 
+/** One phase's failed run, in the shape {@link VerifyApplicationResult} reports it. */
+function failedRun(
+  phase: "with" | "without",
+  program: string,
+  result: RunProcessResult,
+): NonNullable<VerifyApplicationResult["failure"]> {
+  return {
+    phase,
+    output: result.output,
+    program,
+    spawnFailed: result.spawnFailed,
+    spawnErrorCode: result.spawnErrorCode,
+  };
+}
+
 /**
  * Runs the project's own check twice: once with the TraceRoot credential
  * present, once with it removed.
@@ -407,15 +422,7 @@ export async function verifyApplication(
         passed: false,
         skippedReason: null,
       },
-      failure: alreadyBroken
-        ? null
-        : {
-            phase: "with",
-            output: first.output,
-            program: parsed.program,
-            spawnFailed: first.spawnFailed,
-            spawnErrorCode: first.spawnErrorCode,
-          },
+      failure: alreadyBroken ? null : failedRun("with", parsed.program, first),
       withheld: [],
       ranAt,
     };
@@ -450,16 +457,7 @@ export async function verifyApplication(
       passed,
       skippedReason: null,
     },
-    failure:
-      second.result.exitCode === 0
-        ? null
-        : {
-            phase: "without",
-            output: second.result.output,
-            program: parsed.program,
-            spawnFailed: second.result.spawnFailed,
-            spawnErrorCode: second.result.spawnErrorCode,
-          },
+    failure: passed ? null : failedRun("without", parsed.program, second.result),
     withheld: second.withheld,
     ranAt,
   };

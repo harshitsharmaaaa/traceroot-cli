@@ -2870,6 +2870,35 @@ function workingDirectoryState(path: string): "usable" | "missing" | "not-a-dire
   }
 }
 
+/**
+ * Why a check's program could not be started, and what to do about it.
+ *
+ * `spawnFailed` is every spawn failure, not just a missing program, so the code
+ * decides the wording: a command that exists but cannot be executed is a
+ * different problem with a different remedy, and telling that user it "was not
+ * found" sends them looking for a file they have.
+ */
+function unstartableWording(
+  program: string,
+  code: string | undefined,
+): { reason: string; fix: string } {
+  if (code === "ENOENT") {
+    return {
+      reason: `\`${program}\` was not found`,
+      fix: "Install it, or run setup from the environment that has it,",
+    };
+  }
+  if (code === "EACCES") {
+    return { reason: `\`${program}\` is not executable`, fix: "Make it executable," };
+  }
+  // ENOTDIR, E2BIG, EPERM and the rest: naming a remedy for a cause this has
+  // not identified would be guessing.
+  return {
+    reason: `\`${program}\` could not be started${code === undefined ? "" : ` (${code})`}`,
+    fix: "Fix the cause,",
+  };
+}
+
 const verifyApplicationStage: StageDefinition = {
   stage: "verify_application",
   // An inconclusive result is settled, not pending. Re-running a suite that was
@@ -2941,7 +2970,7 @@ const verifyApplicationStage: StageDefinition = {
       // "nobody looked", and the failure path below says so rather than naming
       // a cause it cannot establish.
       baseline: ctx.checkpoint.applicationBaseline ?? null,
-      cwd: service.path === "." ? ctx.root : join(ctx.root, service.path),
+      cwd: serviceDir,
       parentEnv: deps.env,
       // The same virtualenv the baseline measured in. `detect_stack` names the
       // check as the project documents it — `pytest`, not `.venv/bin/pytest` —
@@ -2994,12 +3023,6 @@ const verifyApplicationStage: StageDefinition = {
     // The fix for *that* is the branch below, and it swallowed a command that
     // could not be started. All three conflated "did not run" with "ran and
     // failed"; a fourth will too unless the distinction is made here.
-    // A command that could not be started cannot have been baselined either, so
-    // it arrives here as "inconclusive" and this branch would swallow it — and
-    // with it the one thing the user can act on, that the command was never
-    // found. Three fixes in a row conflated "did not run" with "ran and
-    // failed"; the spawn-failure fields this change adds are what finally let
-    // the two be told apart, so the distinction is made here.
     if (verification.outcome === "inconclusive" && failure?.spawnFailed !== true) {
       // Not a failure of this run, by one of two routes, and the sentence has
       // to say which. Measured and already red is a finding about the project.
@@ -3017,35 +3040,23 @@ const verifyApplicationStage: StageDefinition = {
     }
 
     if (!verification.passed) {
-      // Only the tail of the failing run's output: enough to see the error,
-      // little enough that a chatty test suite does not bury the remedy.
-      const tail =
-        failure === null ? "" : `\n\n${failure.output.split("\n").slice(-25).join("\n").trim()}`;
+      const tail = failure === null ? "" : `\n\n${outputTail(failure.output)}`;
       // A command that is not installed never ran, so it has no output to
       // show and nothing about the instrumentation to blame. Saying it
       // "failed after instrumentation" sends the user looking through code
       // that is fine, and the empty log gives them nothing to go on.
-      // `spawnFailed` is every spawn failure, not just a missing program, so
-      // the code decides the wording: a command that exists but cannot be
-      // executed is a different problem with a different remedy, and telling
-      // that user it "was not found" sends them looking for a file they have.
-      const unstartable = failure?.spawnFailed === true ? failure : null;
-      const reason =
-        unstartable === null
-          ? null
-          : unstartable.spawnErrorCode === "ENOENT"
-            ? `\`${unstartable.program}\` was not found`
-            : unstartable.spawnErrorCode === "EACCES"
-              ? `\`${unstartable.program}\` is not executable`
-              : `\`${unstartable.program}\` could not be started${unstartable.spawnErrorCode === undefined ? "" : ` (${unstartable.spawnErrorCode})`}`;
+      const unstartable =
+        failure?.spawnFailed === true
+          ? unstartableWording(failure.program, failure.spawnErrorCode)
+          : null;
       // Of the rest, only one is a claim this run can support. "Failed after
       // instrumentation" was printed whether or not anything had established
       // that it passed before — which on a suite that was already red sent the
       // user looking for a fault in work that had just been done correctly.
       const measuredBefore = verification.baseline?.ran === true;
       const message =
-        reason !== null
-          ? `\`${command}\` could not be run: ${reason}.`
+        unstartable !== null
+          ? `\`${command}\` could not be run: ${unstartable.reason}.`
           : failure?.phase === "without"
             ? `\`${command}\` passed with TraceRoot configured but failed with ${KEY_ENV} removed. The application must keep working when TraceRoot is absent.${tail}`
             : measuredBefore
@@ -3060,16 +3071,10 @@ const verifyApplicationStage: StageDefinition = {
         code: "APP_VERIFICATION_FAILED",
         message,
         remedy:
-          reason === null
+          unstartable === null
             ? "Nothing was reverted. Fix the failure, then rerun `traceroot setup --resume` to finish verification."
             : [
-                unstartable?.spawnErrorCode === "ENOENT"
-                  ? "Nothing was reverted. Install it, or run setup from the environment that has it,"
-                  : unstartable?.spawnErrorCode === "EACCES"
-                    ? "Nothing was reverted. Make it executable,"
-                    : // ENOTDIR, E2BIG, EPERM and the rest: naming a remedy for
-                      // a cause this has not identified would be guessing.
-                      "Nothing was reverted. Fix the cause,",
+                `Nothing was reverted. ${unstartable.fix}`,
                 "then rerun `traceroot setup --resume` to finish verification.",
               ].join("\n"),
       });

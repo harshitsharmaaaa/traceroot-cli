@@ -63,12 +63,17 @@ describe("finding the Python a service actually runs on", () => {
   });
 });
 
-/**
- * Runs `fn` with the platform reported as Windows.
- *
- * The case-folding branch is Windows-only and CI runs on Linux, so without
- * this the half of the behaviour that exists for Windows is never executed.
- */
+/** Runs `fn` with `process.platform` reported as `platform`, then restores it. */
+function onPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const real = process.platform;
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  try {
+    return fn();
+  } finally {
+    Object.defineProperty(process, "platform", { value: real, configurable: true });
+  }
+}
+
 /**
  * Runs `fn` with the platform reported as POSIX.
  *
@@ -78,23 +83,17 @@ describe("finding the Python a service actually runs on", () => {
  * delete the other spelling, and fail.
  */
 function onPosix<T>(fn: () => T): T {
-  const real = process.platform;
-  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
-  try {
-    return fn();
-  } finally {
-    Object.defineProperty(process, "platform", { value: real, configurable: true });
-  }
+  return onPlatform("linux", fn);
 }
 
+/**
+ * Runs `fn` with the platform reported as Windows.
+ *
+ * The case-folding branch is Windows-only and CI runs on Linux, so without
+ * this the half of the behaviour that exists for Windows is never executed.
+ */
 function onWindows<T>(fn: () => T): T {
-  const real = process.platform;
-  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-  try {
-    return fn();
-  } finally {
-    Object.defineProperty(process, "platform", { value: real, configurable: true });
-  }
+  return onPlatform("win32", fn);
 }
 
 describe("running a project's own commands in its virtualenv", () => {

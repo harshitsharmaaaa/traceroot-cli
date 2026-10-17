@@ -403,7 +403,7 @@ export const runProcess: RunProcess = (options) =>
     }
 
     child.on("error", (err) => {
-      if (child.pid === undefined) {
+      if (!hasProcess()) {
         // A failure to start. `spawn` reports EACCES, EAGAIN, EMFILE, ENFILE
         // and ENOENT on this event rather than throwing, and the child it hands
         // back for those never gets a pid — which is what tells them apart from

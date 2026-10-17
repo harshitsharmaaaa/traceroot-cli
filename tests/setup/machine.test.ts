@@ -2264,10 +2264,6 @@ describe("a suite that was already failing", () => {
     // Nothing is claimed about the project's own suite, which was never
     // measured — and nothing is said about it either way.
     expect(plain(err.data)).not.toContain("does not pass");
-    expect(ctx.application?.outcome).toBe("inconclusive");
-    // The run carries on rather than failing: nothing was measured, so there is
-    // nothing to fail on. What it does not yet do is say that the command could
-    // not be started.
     // The outcome is still inconclusive. What changed is the handling: a
     // command that could not be started is reported, not warned about and
     // walked past.
