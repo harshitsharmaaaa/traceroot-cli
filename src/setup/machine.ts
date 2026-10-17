@@ -25,6 +25,7 @@ import {
   openBrowserForPlatform,
   runDeviceFlow,
 } from "../auth/deviceFlow.js";
+import { type HandoffOutcome, type HandoffRedeemOptions, redeemHandoff } from "../auth/handoff.js";
 import {
   type TokenProvider,
   type TokenProviderOptions,
@@ -177,6 +178,11 @@ export interface SetupDeps {
    * `login` sign a user in the same way rather than each having its own.
    */
   runDeviceFlow: (deps: DeviceFlowDeps) => Promise<DeviceFlowResult>;
+  /**
+   * Exchanges browser-first onboarding's one-shot code for a session. Owned by
+   * `src/auth/`, next to the device flow it stands in for.
+   */
+  redeemHandoff: (opts: HandoffRedeemOptions) => Promise<HandoffOutcome>;
   createTokenProvider: (opts: TokenProviderOptions) => TokenProvider;
 }
 
@@ -244,6 +250,7 @@ export function defaultSetupDeps(resolvedAuth: ResolvedAuth): SetupDeps {
     writeCredential: (host, entry) => writeCredential(host, entry),
     deleteCredential: (host) => deleteCredential(host),
     runDeviceFlow: (deviceDeps) => runDeviceFlow(deviceDeps),
+    redeemHandoff: (opts) => redeemHandoff(opts),
     createTokenProvider: (opts) => createTokenProvider(opts),
     probeHost: async (candidate) => {
       try {
@@ -513,6 +520,22 @@ const authenticate: StageDefinition = {
       }
     }
 
+    // Browser-first onboarding's one-shot code, redeemed before anything saved
+    // on disk is consulted. It is explicit intent to authenticate as the
+    // account whose browser printed the command, and the `--project` on that
+    // same line belongs to *that* account — so reusing a stored session would
+    // not merely be the wrong account, it would fail later and elsewhere, as a
+    // confusing project error rather than an auth one.
+    const handoffCode = ctx.flags.handoff?.trim();
+    if (handoffCode !== undefined && handoffCode !== "") {
+      if (await handoffSignIn(ctx, deps, host, handoffCode)) {
+        return "ok";
+      }
+      // Refused. Fall through to the rungs below exactly as if the flag had
+      // not been passed: interactive and nothing stored means the device flow,
+      // which is one extra page and the status quo — never a dead end.
+    }
+
     // A stored credential means this user already signed in on this machine, so
     // there is nothing to prove again. Tried before the browser handoff because
     // skipping it is the entire reason the credential is kept.
@@ -682,6 +705,120 @@ function railWriters(ctx: SetupContext): Writers {
       },
     },
   };
+}
+
+/**
+ * The one line that says a handoff is replacing a different account's sign-in.
+ *
+ * `writeCredential` *replaces* the host's entry, so redeeming a handoff logs
+ * this machine out of whatever was stored. Doing that silently is the bug this
+ * exists to close: a run that quietly reuses — or quietly discards — the wrong
+ * account fails much later, at project selection, where the message says
+ * nothing about which account it is for.
+ *
+ * Returns `undefined` only when there is nothing to say: no stored credential,
+ * or one provably for the same account. Sameness is *proved*, never assumed —
+ * when either side's email is missing the sentence degrades to a non-specific
+ * one rather than going quiet.
+ */
+function accountSwitchLine(
+  previous: CredentialEntry | null,
+  email: string | undefined,
+): string | undefined {
+  if (previous === null) {
+    return undefined;
+  }
+  const signedIn = email === undefined ? "Signed in" : `Signed in as ${wizardValue(email)}`;
+  if (previous.email === undefined || email === undefined) {
+    return `${signedIn}; this handoff replaced the TraceRoot sign-in already saved on this machine.`;
+  }
+  if (previous.email === email) {
+    return undefined;
+  }
+  return `Signed in as ${wizardValue(previous.email)}; this handoff is for ${wizardValue(email)} — switching.`;
+}
+
+/**
+ * Browser-first onboarding's handoff.
+ *
+ * The code was minted by the page the user is already looking at, so redeeming
+ * it here is what lets this run authenticate without a second browser page.
+ * What comes back is the same artifact a device-flow approval returns, written
+ * to the same store through the same shape — from `resolveAuth`'s point of view
+ * the result is an ordinary `credentials-file` session, with no new source and
+ * no new precedence rule.
+ *
+ * Returns false when the server refused the code, so the caller can fall back
+ * to the sign-in it would have used anyway. That is the *only* recoverable
+ * failure: a 429, a 5xx or a timeout is a reachability problem and is raised as
+ * one by `redeemHandoff`, because reporting "your code expired" for a network
+ * fault would send the user hunting for a new code they do not need.
+ */
+async function handoffSignIn(
+  ctx: SetupContext,
+  deps: SetupDeps,
+  host: string,
+  code: string,
+): Promise<boolean> {
+  // Redemption talks to the app, which is not always the API host — a split
+  // local stack runs them on different ports, and the code was minted by the
+  // app. Same resolution the device flow and the token mint already use.
+  const authHost = deps.resolvedAuth.authHost.value ?? host;
+
+  const outcome = await deps.redeemHandoff({ authHost, code });
+  if (outcome.kind === "rejected") {
+    // Unknown, expired and already-redeemed are one answer by design, so this
+    // says the true thing all three have in common rather than guessing.
+    wizardWarn(
+      ctx,
+      "the sign-in code from the browser is no longer valid (it expires after a few minutes, and works once); signing in the normal way",
+    );
+    return false;
+  }
+  const { sessionToken, email } = outcome.credential;
+
+  // Read before the write that replaces it: the announcement is about what is
+  // being lost, and after `writeCredential` there is nothing left to compare.
+  const switched = accountSwitchLine(deps.readCredential(host), email);
+
+  // Exactly the entry the browser path writes — same fields, same key, same
+  // store — so a later run cannot tell which way this machine signed in.
+  const entry: CredentialEntry = {
+    session_token: sessionToken,
+    created_at: deps.now().toISOString(),
+  };
+  if (authHost !== host) {
+    entry.auth_host = authHost;
+  }
+  if (email !== undefined) {
+    entry.email = email;
+  }
+  try {
+    deps.writeCredential(host, entry);
+  } catch {
+    wizardWarn(ctx, "could not save the TraceRoot sign-in for future runs");
+  }
+
+  wizardNote(
+    ctx.writers,
+    [
+      switched ?? (email === undefined ? "Signed in." : `Signed in as ${wizardValue(email)}.`),
+      "",
+      wizardAside("Used the sign-in code from the browser — no second page needed."),
+    ],
+    { settled: true },
+  );
+
+  const signedIn = await userCredentialSignIn(ctx, deps, host, entry, { announce: false });
+  if (!signedIn) {
+    throw new SetupError({
+      stage: "authenticate",
+      code: "NOT_AUTHENTICATED",
+      message: "The credential from the browser handoff was rejected immediately.",
+      remedy: "Run `traceroot setup` again.",
+    });
+  }
+  return true;
 }
 
 /**
