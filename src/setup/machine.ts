@@ -2679,11 +2679,11 @@ function oneLine(note: string, max = 200): string {
  *
  * Called from the failure rather than from the launch, which is what makes the
  * other half of the contract true: a run that worked leaves no transcript
- * behind, because nothing on that path calls this. Its callers are the four
- * ways a launched agent can end this stage with the cause in its own output and
- * nowhere else — it exited non-zero, it reported no edits, the service still
- * has no initialization in it, or the SDK it was told to install cannot be
- * imported.
+ * behind, because nothing on that path calls this. It is reached, through the
+ * `agentEvidence` builder in the stage, from each of the four ways a launched
+ * agent can end this stage with the cause in its own output and nowhere else —
+ * it exited non-zero, it reported no edits, the service still has no
+ * initialization in it, or the SDK it was told to install cannot be imported.
  *
  * The screen is not the fallback for any of them. The activity feed is a window
  * onto the last few tool calls, it has already been cleared by the time the
@@ -2691,7 +2691,7 @@ function oneLine(note: string, max = 200): string {
  * the terminal, and a `--json` run — which is how this is run in CI, where
  * nobody was watching in the first place — never had a feed at all.
  *
- * The line is built in one place so the two remedies cannot drift apart, and it
+ * The line is built in one place so the four remedies cannot drift apart, and it
  * says what the file is and not only where it is: a path with no reason
  * attached is evidence nobody opens.
  */
@@ -3092,6 +3092,18 @@ const instrument: StageDefinition = {
         promptPath: null,
       };
 
+      // Called from each failure below rather than once from here, which is
+      // what keeps the other half of `keepAgentOutput`'s contract true: a run
+      // that worked writes no transcript, because nothing on that path calls
+      // it. The arguments are the same at all four, so they are written once.
+      const agentEvidence = (): readonly string[] =>
+        keepAgentOutput({
+          root: ctx.root,
+          adapter,
+          output: result.output,
+          credential: credential.key,
+        });
+
       if (result.spawnFailed) {
         throw new PausedSetupError({
           stage: "instrument",
@@ -3113,19 +3125,13 @@ const instrument: StageDefinition = {
         // above is not the same thing: it holds the last few parsed activity
         // lines, it goes when the terminal does, and under `--json` there was
         // never a feed to leave anything in.
-        const evidence = keepAgentOutput({
-          root: ctx.root,
-          adapter,
-          output: result.output,
-          credential: credential.key,
-        });
         throw new PausedSetupError({
           stage: "instrument",
           code: "AGENT_FAILED",
           message: `${adapter.displayName} exited with status ${result.exitCode}. ${changed}`,
           remedy: [
             "Nothing was reverted — your changes are intact.",
-            ...evidence,
+            ...agentEvidence(),
             "Fix the issue and rerun `traceroot setup --resume`.",
           ].join("\n"),
         });
@@ -3157,12 +3163,6 @@ const instrument: StageDefinition = {
         observedChangedFiles.length === 0 &&
         ctx.stack?.existingInstrumentation.present !== true;
       if (changedNothing) {
-        const evidence = keepAgentOutput({
-          root: ctx.root,
-          adapter,
-          output: result.output,
-          credential: credential.key,
-        });
         throw new PausedSetupError({
           stage: "instrument",
           code: "AGENT_FAILED",
@@ -3174,7 +3174,7 @@ const instrument: StageDefinition = {
             .join(" "),
           remedy: [
             "An agent that reports no edits was usually stopped from making them — a refused command, or a package install with nowhere writable to cache.",
-            ...evidence,
+            ...agentEvidence(),
             "Clear what blocked it and rerun:",
             "  traceroot setup --resume",
             "Or write the task out and run it yourself:",
@@ -3219,12 +3219,6 @@ const instrument: StageDefinition = {
           ...observedChangedFiles,
         ]);
         if (wiredIn === null) {
-          const evidence = keepAgentOutput({
-            root: ctx.root,
-            adapter,
-            output: result.output,
-            credential: credential.key,
-          });
           throw new PausedSetupError({
             stage: "instrument",
             code: "AGENT_FAILED",
@@ -3238,7 +3232,7 @@ const instrument: StageDefinition = {
               .join(" "),
             remedy: [
               "Exit 0 is the agent saying it finished, not that it wired anything up — a refused command and an exhausted context both end that way.",
-              ...evidence,
+              ...agentEvidence(),
               "Nothing was reverted, so a rerun picks up from whatever it did get done:",
               "  traceroot setup --resume",
               "Or write the task out and run it yourself:",
@@ -3255,18 +3249,12 @@ const instrument: StageDefinition = {
         // take. Why it did not is in the output — a refused command, a cache
         // with nowhere writable, a PEP 668 refusal — and the feed was cleared
         // the moment the agent finished, several checks above this one.
-        const evidence = keepAgentOutput({
-          root: ctx.root,
-          adapter,
-          output: result.output,
-          credential: credential.key,
-        });
         throw new PausedSetupError({
           stage: "instrument",
           code: "AGENT_FAILED",
           message: `${adapter.displayName} finished, but \`import ${sdkCheck.check.module}\` fails under ${sdkCheck.check.display} — the ${sdk.package} SDK was not installed, so the instrumented code cannot run.`,
           remedy: [
-            ...evidence,
+            ...agentEvidence(),
             "Install it yourself, then rerun `traceroot setup --resume`:",
             `  ${install}`,
             // Only for the `pip` form. `uv` and `poetry` manage their own
