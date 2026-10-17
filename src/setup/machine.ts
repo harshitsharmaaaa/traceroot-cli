@@ -2180,31 +2180,23 @@ async function handoverAgent(ctx: SetupContext, deps: SetupDeps): Promise<Detect
 }
 
 /**
- * The agent to name on a hand-over, or null when naming one would be a fiction.
- *
- * `generic` is the registry's entry for "no particular agent" — its display
- * name is "Agent (generic)", which is a category and not somewhere a user can
- * go and open a file.
- */
-function handoverAgentName(ctx: SetupContext): string | null {
-  const agent = ctx.agent;
-  return agent === undefined || agent.id === "generic" ? null : agent.displayName;
-}
-
-/**
- * "Run it in Codex", or — when nothing was found to name — a sentence that says
+ * "Run it in Codex", or — when there is no agent to name — a sentence that says
  * the task works anywhere rather than dead-ending on an agent the user has not
  * got. `subject` is whatever reads best where it is used: "it" straight after
  * the line that named the file, the path itself where nothing has.
+ *
+ * `generic` is no agent to name: it is the registry's entry for "no particular
+ * agent", and its display name — "Agent (generic)" — is a category rather than
+ * somewhere a user can go and open a file.
  *
  * Shared by the hand-over itself and by the trace stage that has to repeat it,
  * so the two cannot come to disagree about where the task is supposed to run.
  */
 function runTaskSentence(ctx: SetupContext, subject: string): string {
-  const name = handoverAgentName(ctx);
-  return name === null
+  const agent = ctx.agent;
+  return agent === undefined || agent.id === "generic"
     ? `No coding agent is set up here, but the task is self-contained — run ${subject} in whichever agent you use`
-    : `Run ${subject} in ${name}`;
+    : `Run ${subject} in ${agent.displayName}`;
 }
 
 /**
@@ -2248,21 +2240,30 @@ async function chooseInstrumentation(
     }),
   });
 
+  // The other half of the same decision. Spelled once for the same reason
+  // `withAgent` is: four of the returns below differ only in which method they
+  // name, and the agent a hand-over targets is not a question any of them
+  // answers differently.
+  const withHandover = async (
+    method: Exclude<InstrumentMethod, "agent">,
+  ): Promise<InstrumentationChoice> => ({
+    method,
+    agent: await handoverAgent(ctx, deps),
+  });
+
   if (ctx.flags.method !== undefined) {
-    return ctx.flags.method === "agent"
-      ? await withAgent()
-      : { method: ctx.flags.method, agent: await handoverAgent(ctx, deps) };
+    return ctx.flags.method === "agent" ? await withAgent() : await withHandover(ctx.flags.method);
   }
   // `--no-instrument` predates the three-way choice and means "do not run one".
   if (!ctx.flags.instrument) {
-    return { method: "task-file", agent: await handoverAgent(ctx, deps) };
+    return await withHandover("task-file");
   }
   // An explicit `--agent` is an unambiguous request to launch that agent.
   if (ctx.flags.agent !== undefined) {
     return await withAgent();
   }
   if (!ctx.canPrompt) {
-    return { method: "task-file", agent: await handoverAgent(ctx, deps) };
+    return await withHandover("task-file");
   }
 
   const runnable = detected.filter((agent) => agent.runnable);
@@ -2291,7 +2292,7 @@ async function chooseInstrumentation(
       message: `'${answer}' is not one of the offered ways to instrument this service.`,
     });
   }
-  return { method: answer, agent: await handoverAgent(ctx, deps) };
+  return await withHandover(answer);
 }
 
 // ── INSTALL_AGENT_CONTEXT ───────────────────────────────────────────────────
@@ -2411,6 +2412,34 @@ function oneLine(note: string, max = 200): string {
  */
 function instrumentTaskPath(root: string): string {
   return join(root, ".traceroot", "prompts", "setup-instrument.md");
+}
+
+/**
+ * Records a hand-over: the stage result for a route that ran nothing, and the
+ * route itself on the checkpoint.
+ *
+ * Both in one place because the two have to agree. `restore()` rebuilds the
+ * result from the recorded route alone — `"task-file"` wrote a task file,
+ * `"manual"` printed instructions — so a branch that recorded one route and
+ * returned the shape of the other would resume as something it never was. The
+ * task path is derived from the route here for that reason rather than passed
+ * in beside it, and every remaining field is the zero of "no run happened".
+ */
+function recordHandover(
+  ctx: SetupContext,
+  agentId: DetectedAgent["id"],
+  route: "task-file" | "manual",
+): void {
+  ctx.checkpoint.instrumentHandover = route;
+  ctx.instrumentation = {
+    agentId,
+    mode: "prompt-only",
+    exitCode: 0,
+    durationMs: 0,
+    reported: null,
+    observedChangedFiles: [],
+    promptPath: route === "task-file" ? instrumentTaskPath(ctx.root) : null,
+  };
 }
 
 const instrument: StageDefinition = {
@@ -2538,16 +2567,7 @@ const instrument: StageDefinition = {
         skillPath: displaySkillPath(ctx.root, adapter.getSkillInstallPath(ctx.root, SKILL_NAME)),
       });
       wizardLine(ctx, `\n${instructions}`);
-      ctx.checkpoint.instrumentHandover = "manual";
-      ctx.instrumentation = {
-        agentId: agent.id,
-        mode: "prompt-only",
-        exitCode: 0,
-        durationMs: 0,
-        reported: null,
-        observedChangedFiles: [],
-        promptPath: null,
-      };
+      recordHandover(ctx, agent.id, "manual");
       return "skipped";
     }
 
@@ -2559,16 +2579,7 @@ const instrument: StageDefinition = {
       const { mkdirSync, writeFileSync } = await import("node:fs");
       mkdirSync(dirname(promptPath), { recursive: true });
       writeFileSync(promptPath, task, "utf8");
-      ctx.checkpoint.instrumentHandover = "task-file";
-      ctx.instrumentation = {
-        agentId: agent.id,
-        mode: "prompt-only",
-        exitCode: 0,
-        durationMs: 0,
-        reported: null,
-        observedChangedFiles: [],
-        promptPath,
-      };
+      recordHandover(ctx, agent.id, "task-file");
       wizardLine(
         ctx,
         `\nWrote the instrumentation task to ${displaySkillPath(ctx.root, promptPath)}.\n${runTaskSentence(ctx, "it")}, then rerun \`traceroot setup --resume\`.`,
@@ -3195,9 +3206,11 @@ const verifyTrace: StageDefinition = {
     // still current — and a repository the user had instrumented by hand before
     // running setup is therefore not caught by this, which is the point. It
     // still gets its full wait and its verification.
-    const handover = ctx.instrumentation?.mode === "prompt-only" ? ctx.instrumentation : null;
     const unrunHandover =
-      handover !== null && ctx.stack?.existingInstrumentation.present !== true ? handover : null;
+      ctx.instrumentation?.mode === "prompt-only" &&
+      ctx.stack?.existingInstrumentation.present !== true
+        ? ctx.instrumentation
+        : null;
 
     // Both impossibilities, not just the first: an uninstrumented application
     // emits nothing however many times its test suite runs it, so there is no
