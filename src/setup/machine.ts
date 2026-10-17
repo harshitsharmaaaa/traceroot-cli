@@ -70,7 +70,7 @@ import {
 } from "./sdk.js";
 import { type Secret, makeSecret } from "./secret.js";
 import { type SelectFn, type SelectOption, interactiveSelect } from "./select.js";
-import { startLineSpinner } from "./spinner.js";
+import { type LineSpinner, startLineSpinner } from "./spinner.js";
 import {
   detectStack,
   findTraceRootInitialization,
@@ -3434,13 +3434,22 @@ const verifyTrace: StageDefinition = {
     // The other long unattended wait. Nothing arrives to report on until the
     // trace does, so the elapsed counter is the whole of what a user can be
     // told — and it is the difference between waiting and suspecting a hang.
-    const waiting =
-      ctx.json || !couldArrive
-        ? null
-        : startLineSpinner({
-            sink: ctx.writers.err,
-            message: `Waiting for your first trace (up to ${ctx.flags.traceTimeoutSec}s)`,
-          });
+    //
+    // A blank rail line above it, the same way the agent block gets one: this
+    // is the run's other two-minute wait and it sat flush against the
+    // verification lines over it, reading as one more of them rather than as
+    // the state of the whole run. Written only when the spinner is: with
+    // nothing to wait for no line is drawn at all, and a `--json` run has no
+    // frame for one to sit in, so either way the gap would be a blank line with
+    // nothing under it.
+    let waiting: LineSpinner | null = null;
+    if (!ctx.json && couldArrive) {
+      wizardLine(ctx, "");
+      waiting = startLineSpinner({
+        sink: ctx.writers.err,
+        message: `Waiting for your first trace (up to ${ctx.flags.traceTimeoutSec}s)`,
+      });
+    }
 
     let outcome: Awaited<ReturnType<typeof pollForTrace>>;
     try {

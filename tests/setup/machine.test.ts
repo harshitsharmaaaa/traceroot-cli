@@ -4249,6 +4249,23 @@ describe("why no trace arrived", () => {
     expect(plain(err.data)).toContain("Waiting for your first trace");
   });
 
+  it("keeps a blank line above the wait", async () => {
+    // The wait is the one line left moving for up to two minutes, and it sat
+    // flush against the verification lines above it — reading as one more of
+    // them rather than as the state of the whole run. A rail-only line first,
+    // the same way the agent block gets one.
+    pythonRepo();
+    alreadyInstrumented();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+    await runSetupMachine(ctx, traceless());
+
+    const lines = plain(err.data).split("\n");
+    const spinner = lines.findIndex((line) => line.includes("Waiting for your first trace"));
+    expect(spinner).toBeGreaterThan(0);
+    expect(lines[spinner - 1]?.trim()).toBe("\u2502");
+  });
+
   it("still blames the unrun application when an agent did the instrumenting", async () => {
     // The other diagnosis has to keep working: here the code *was* changed, and
     // there is no test or health command to exercise it.
