@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { type ApiClient, type ApiClientOptions, DEFAULT_TIMEOUT_MS } from "../../src/api/client.js";
@@ -13,6 +13,7 @@ import type { RunProcessOptions, RunProcessResult } from "../../src/setup/exec.j
 import type { SetupDeps } from "../../src/setup/machine.js";
 import type { ResolvedSdk } from "../../src/setup/sdk.js";
 import { makeSecret } from "../../src/setup/secret.js";
+import { detectStack, findTraceRootInitialization } from "../../src/setup/stack.js";
 import type { SetupFlags } from "../../src/setup/types.js";
 import { StringSink } from "../helpers/stringSink.js";
 
@@ -57,43 +58,36 @@ export interface FakeProcessOptions {
 /** The agents setup can actually launch; see `LAUNCHABLE_AGENT_IDS`. */
 const AGENT_PROGRAMS = new Set(["claude", "codex"]);
 
-/** Where an entry point is looked for, mirroring `stack.ts`'s own lists. */
-const ENTRY_POINTS = [
-  "main.py",
-  "app.py",
-  "src/main.py",
-  "src/app.py",
-  "manage.py",
-  "index.ts",
-  "index.js",
-  "src/index.ts",
-  "src/index.js",
-  "server.ts",
-  "server.js",
-  "app.ts",
-  "app.js",
-];
-
 /**
  * The one edit the fake agent makes: a real `initialize()` call in the entry
  * point, in the form the detector recognizes for that language.
+ *
+ * Which file that is, and whether it is already instrumented, are both asked of
+ * the production detector rather than answered by a copy of its rules here. A
+ * copy drifts in two directions and both produce a lying fixture: a different
+ * entry point from the one `detect_stack` reads leaves the service the run
+ * checks untouched, and a narrower idea of what counts as instrumentation (an
+ * exact `traceroot.initialize(` and nothing else) appends a second
+ * initialization to a fixture that was wired up with `traceroot.init()` or an
+ * imported bare `initialize()`.
  *
  * Appended rather than written over, so a fixture that already carries
  * instrumentation (or any other content a test asserts on) keeps it.
  */
 function instrumentEntryPoint(cwd: string): void {
-  const entry = ENTRY_POINTS.find((candidate) => existsSync(join(cwd, candidate)));
-  if (entry === undefined) {
+  // The agent is launched in the service directory, so that is the root the
+  // detector is asked about and the service is the one at `.`.
+  const service = detectStack(cwd).selected;
+  if (service === null || service.entryPoint === null) {
     return;
   }
-  const path = join(cwd, entry);
-  const source = readFileSync(path, "utf8");
-  if (source.includes("traceroot.initialize(")) {
+  // By the detector's own rules, not a substring of one of them.
+  if (findTraceRootInitialization(cwd, service) !== null) {
     return;
   }
   appendFileSync(
-    path,
-    entry.endsWith(".py")
+    join(cwd, service.entryPoint),
+    service.language === "python"
       ? "\nimport traceroot\n\ntraceroot.initialize()\n"
       : '\nimport * as traceroot from "traceroot";\n\ntraceroot.initialize();\n',
     "utf8",

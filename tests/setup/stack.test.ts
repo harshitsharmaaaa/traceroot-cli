@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { detectStack } from "../../src/setup/stack.js";
+import { detectStack, findTraceRootInitialization } from "../../src/setup/stack.js";
 
 /** Every root this file makes, so none is left behind in the system tmpdir. */
 const roots: string[] = [];
@@ -170,5 +170,56 @@ describe("choosing a Node service's verification command", () => {
     const root = nodeRepo({ test: NPM_INIT_PLACEHOLDER, typecheck: "   " });
 
     expect(detectStack(root).selected?.testCommand).toBeNull();
+  });
+});
+
+describe("reading whether a service is wired up now", () => {
+  /** The detected service, which is what the real caller has in hand. */
+  function serviceIn(root: string) {
+    const service = detectStack(root).selected;
+    if (service === null) {
+      throw new Error("the fixture produced no service to read");
+    }
+    return service;
+  }
+
+  it("looks inside a directory git reported as one untracked entry", () => {
+    // `git status --porcelain` without `-uall` reports a wholly untracked
+    // directory as `telemetry/` rather than the files in it, so that is the
+    // spelling this is handed when an agent puts the initialization in a new
+    // module — and reading it as a file answers null however instrumented the
+    // module is, which failed runs that had worked.
+    const root = repo({
+      "pyproject.toml": '[project]\ndependencies = ["fastapi"]\n',
+      "main.py": "import telemetry\n\nprint('hi')\n",
+      "telemetry/tracing.py": "import traceroot\n\ntraceroot.initialize()\n",
+    });
+
+    expect(findTraceRootInitialization(root, serviceIn(root), ["telemetry/"])).toBe(
+      "telemetry/tracing.py",
+    );
+  });
+
+  it("does not certify a service from a compiled bundle in such a directory", () => {
+    // The exclusion survives the expansion: a bundle mentions everything it
+    // ever imported, so reading one reports instrumentation that is not in the
+    // source.
+    const root = repo({
+      "pyproject.toml": '[project]\ndependencies = ["fastapi"]\n',
+      "main.py": "print('hi')\n",
+      "dist/bundle.js": "traceroot.initialize();\n",
+    });
+
+    expect(findTraceRootInitialization(root, serviceIn(root), ["dist/"])).toBeNull();
+  });
+
+  it("answers null for a directory that holds no initialization", () => {
+    const root = repo({
+      "pyproject.toml": '[project]\ndependencies = ["fastapi"]\n',
+      "main.py": "print('hi')\n",
+      "telemetry/tracing.py": "def start():\n    pass\n",
+    });
+
+    expect(findTraceRootInitialization(root, serviceIn(root), ["telemetry/"])).toBeNull();
   });
 });

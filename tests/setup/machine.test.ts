@@ -3094,6 +3094,29 @@ describe("proving the agent did something", () => {
     expect(result.stagesRun.map((s) => s.stage)).not.toContain("verify_trace");
   });
 
+  it("instruments the entry point the detector picked, not a guess at one", async () => {
+    // `src/main.ts` is on the detector's Node list and was missing from the
+    // fake agent's own copy of it, so the agent edited nothing and a run that
+    // should have passed failed as uninstrumented. The helper asks the detector
+    // now, and this is the fixture that tells it apart.
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ dependencies: { next: "^14" } }));
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, "src", "main.ts"), "export {};\n");
+    initGit();
+    const process = fakeRunProcess({ gitStatus: ["", " M src/main.ts"] });
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: process.run,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error).toBeNull();
+    expect(readFileSync(join(dir, "src", "main.ts"), "utf8")).toContain("traceroot.initialize()");
+  });
+
   it("catches an uninstrumented service outside a git repository", async () => {
     // No `.git`, so `observedChangedFiles` is empty however much the agent did
     // or did not do, and an inference from file counts is blind here. Reading
@@ -3126,6 +3149,9 @@ describe("proving the agent did something", () => {
     // entry point alone, which is why the run starts out "not instrumented".
     pythonRepo();
     writeFileSync(join(dir, "tracing.py"), "import traceroot\n\ntraceroot.initialize()\n");
+    // The entry point imports it, which is what makes this module the
+    // service's instrumentation rather than an unrelated initialized file.
+    writeFileSync(join(dir, "main.py"), "import tracing\n\nprint('hi')\n");
     const process = fakeRunProcess({
       instrument: false,
       results: {
