@@ -124,29 +124,42 @@ export async function redeemHandoff(opts: HandoffRedeemOptions): Promise<Handoff
     throw new CliError(`request to ${base} failed: ${redact(message)}`, ExitCode.network);
   }
 
+  // Every exit below is decided on the status alone and never reads the body.
+  // An unread body holds its stream — and the socket under it — until the
+  // server gives up, which is a CLI that has printed its error and will not
+  // exit. Same discipline as `commands/logout.ts` and the client's 401 retry.
+  const dropBody = async (): Promise<void> => {
+    await res.body?.cancel().catch(() => {});
+  };
+
   // One indistinguishable refusal for unknown / expired / already-redeemed.
   // Recoverable by contract: the caller signs in the ordinary way instead.
   if (res.status === 401 || res.status === 403) {
+    await dropBody();
     return { kind: "rejected" };
   }
   if (res.status === 429) {
+    await dropBody();
     throw new CliError(
       "handoff sign-in rate limited — wait a moment and try again",
       ExitCode.network,
     );
   }
   if (res.status >= 500) {
+    await dropBody();
     throw new CliError(`handoff sign-in failed with status ${res.status}`, ExitCode.network);
   }
   if (res.status === 404) {
     // A deployment that predates the route. Not a bad code, and not something
     // a retry fixes — say where it was looked for.
+    await dropBody();
     throw new CliError(
       `${base} does not support handoff sign-in (no /api/cli/handoff/redeem)`,
       ExitCode.notFound,
     );
   }
   if (!res.ok) {
+    await dropBody();
     throw new CliError(`handoff sign-in failed with status ${res.status}`, ExitCode.internal);
   }
 
@@ -157,7 +170,15 @@ export async function redeemHandoff(opts: HandoffRedeemOptions): Promise<Handoff
     // A stall streaming the body is a network timeout, not a malformed
     // response — match token.ts so the exit-code contract stays honest.
     throwIfTimeout(err);
-    throw new CliError("handoff sign-in returned an unreadable response", ExitCode.internal);
+    // The other two are not one failure either. Malformed JSON is the server's
+    // answer and no retry changes it; a transport fault part-way through the
+    // body is the opposite, and reporting it as an internal error sends the
+    // reader to look for a bug rather than to try again. `runDeviceFlow`'s
+    // `readBody` draws the line in the same place.
+    if (err instanceof SyntaxError) {
+      throw new CliError("handoff sign-in returned an unreadable response", ExitCode.internal);
+    }
+    throw new CliError(`request to ${base} failed while reading the response`, ExitCode.network);
   }
   // A JSON `null` or a non-object body is malformed — read fields only off a
   // real object so it never throws a raw TypeError.

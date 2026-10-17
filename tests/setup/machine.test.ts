@@ -1147,7 +1147,7 @@ describe("the handoff code from browser-first onboarding", () => {
   }
 
   /** Resolved auth holding an API key the user never asked this run to use. */
-  function ambientKey(source: "config" | "auto-env-file"): ResolvedAuth {
+  function ambientKey(source: "config" | "auto-env-file" | "credentials-file"): ResolvedAuth {
     return {
       credential: { kind: "api-key", value: "tr-stale-ambient-key", source },
       hostUrl: { value: "https://api.example.test", source: "config" },
@@ -1369,6 +1369,20 @@ describe("the handoff code from browser-first onboarding", () => {
     expect(run.minted).toEqual(["handoff-session-token"]);
     expect(said(run.err.data)).toContain(
       "A TraceRoot API key is configured in your TraceRoot config file; the sign-in code from the browser takes precedence.",
+    );
+  });
+
+  it("names the credentials file when the ambient key came from there", async () => {
+    // `resolveAuth` reclassifies a `tr_`-shaped value in the session store as
+    // an API key and keeps the source, so this is reachable — and the config
+    // file it used to name is not where the key is.
+    const run = handoffRun({ auth: ambientKey("credentials-file") });
+    const result = await runSetupMachine(run.ctx, run.deps);
+
+    expect(result.ok).toBe(true);
+    expect(run.keysUsed).not.toContain("tr-stale-ambient-key");
+    expect(said(run.err.data)).toContain(
+      "A TraceRoot API key is configured in your TraceRoot credentials file; the sign-in code from the browser takes precedence.",
     );
   });
 

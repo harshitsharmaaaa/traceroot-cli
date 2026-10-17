@@ -454,13 +454,22 @@ function apiKeyFrom(auth: SetupDeps["resolvedAuth"]): string | undefined {
  * The line that says an ambient API key was set aside for a handoff code.
  *
  * Named by where it came from, because "a key is configured" is not actionable
- * when the reader cannot see *which* key — and the two places differ in how
+ * when the reader cannot see *which* key — and the places differ in how
  * surprising they are: a `.env` belongs to the repository the user is standing
- * in, the config file belongs to the machine.
+ * in, while the config and credentials files belong to the machine.
+ *
+ * The credentials file is in here because `resolveAuth` reclassifies a
+ * `tr_`-shaped value found in its session slot as an API key, source and all —
+ * so "an ambient API key" really can come from there, and naming the config
+ * file for it sends the reader to edit a file that has nothing in it.
  */
 function ambientKeySetAside(source: ResolvedAuth["credential"]["source"]): string {
   const where =
-    source === "auto-env-file" ? "in this directory's .env" : "in your TraceRoot config file";
+    source === "auto-env-file"
+      ? "in this directory's .env"
+      : source === "credentials-file"
+        ? "in your TraceRoot credentials file"
+        : "in your TraceRoot config file";
   return `A TraceRoot API key is configured ${where}; the sign-in code from the browser takes precedence.`;
 }
 
