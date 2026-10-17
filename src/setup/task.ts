@@ -276,11 +276,12 @@ function relativeInterpreter(interpreter: string, root: string, servicePath: str
  * refusal there costs the whole run, because the code gets instrumented and
  * nothing is allowed to execute it.
  *
- * There are two because the task names the interpreter twice and the quoting
- * differs: absolutely in the install step, where the quotes are written for the
- * agent, and relatively in the run command, where they are not (see
- * `relativeInterpreter`). `null` is a service with no virtualenv at all, where
- * the task's own advice is to create one and use it from then on.
+ * There are two because the task names the interpreter twice: absolutely in
+ * the install step and relatively in the run command (see
+ * `relativeInterpreter`). The install step also single-quotes it for the shell;
+ * that spelling is read off the command itself, by {@link leadingProgram}, so
+ * the quoting is written in one place. `null` is a service with no virtualenv
+ * at all, where the task's own advice is to create one and use it from then on.
  */
 export function taskInterpreters(
   interpreter: string | null,
@@ -322,17 +323,22 @@ function serviceRunLine(
  * The program a command starts with, as a permission rule has to name it, or
  * null when there is nothing for a rule to name.
  *
- * A leading quote means the command names an absolute interpreter whose path
- * needed quoting — `installCommand`'s pip branch is the only one that does
- * that, and the interpreter it quotes is already allowed under both of the
- * spellings {@link taskInterpreters} returns. Un-escaping the quoting to
- * recover it here would be a second place that has to agree with how it was
- * written.
+ * Taken as written, quotes included, because a rule matches the start of a
+ * command literally. `installCommand`'s pip branch single-quotes an absolute
+ * interpreter, closing and re-opening around any `'` in the path, so that
+ * command starts with `'<path>'`, a prefix `Bash(<path>:*)` does not name. The
+ * word is kept whole rather than split on whitespace, which would cut a path
+ * with a space in two, and rather than un-escaped, which would be a second
+ * place that has to agree with how it was quoted.
  */
 function leadingProgram(command: string): string | null {
   const trimmed = command.trim();
-  if (trimmed === "" || trimmed.startsWith("'")) {
+  if (trimmed === "") {
     return null;
+  }
+  if (trimmed.startsWith("'")) {
+    // One shell word: single-quoted runs, with an escaped `'` between them.
+    return /^(?:'[^']*'|\\')+/.exec(trimmed)?.[0] ?? null;
   }
   return trimmed.split(/\s+/)[0] ?? null;
 }

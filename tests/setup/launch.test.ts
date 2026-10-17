@@ -376,6 +376,17 @@ describe("the interpreter the task recommends and the one the agent may run", ()
     return (command as string).split(" ")[0];
   }
 
+  /**
+   * The interpreter word step 2's pip command starts with, as written — quotes,
+   * escapes and any space in the path included, which `split(" ")` would cut.
+   */
+  function interpreterInPipInstall(text: string): string {
+    const command = /### 2\. Install the SDK[\s\S]*?```bash\n([^\n]+)\n```/.exec(text)?.[1] ?? "";
+    const at = command.indexOf(" -m pip install ");
+    expect(at, "step 2 is a pip install through a named interpreter").toBeGreaterThan(0);
+    return command.slice(0, at);
+  }
+
   /** And for the check the task tells the agent to run once, when one exists. */
   function programInCheckCommand(text: string): string {
     const command = /1\. Run `([^`]+)` once and confirm it passes\./.exec(text)?.[1];
@@ -390,9 +401,25 @@ describe("the interpreter the task recommends and the one the agent may run", ()
     // the one a caller has in hand, and it is not the one the task gives.
     expect(named).not.toBe(interpreter);
     expect(rules(interpreter)).toContain(`Bash(${named}:*)`);
-    // And the absolute path as well: the install step names it that way,
-    // quotes included, because there the quoting is written for the agent.
+    // And the install step's spelling: absolute, and single-quoted for the
+    // shell. A rule matches the start of a command literally, so the quotes are
+    // part of what it has to name — the unquoted rule does not cover it.
+    const installed = interpreterInPipInstall(task(interpreter));
+    expect(installed).toBe(`'${interpreter}'`);
+    expect(rules(interpreter)).toContain(`Bash(${installed}:*)`);
+    // The unquoted absolute path stays allowed beside it.
     expect(rules(interpreter)).toContain(`Bash(${interpreter}:*)`);
+  });
+
+  it("allows the quoted interpreter whole when its path has a space or a quote", () => {
+    // A repository path routinely contains a space, and the pip command closes
+    // and re-opens its quoting around a `'`. Split on whitespace, the word is
+    // cut in two and the rule names a path that is not the interpreter.
+    const interpreter = "/opt/it's here/bin/python3";
+    const installed = interpreterInPipInstall(task(interpreter));
+    expect(installed).toContain(" ");
+    expect(installed).toContain("'\\''");
+    expect(rules(interpreter)).toContain(`Bash(${installed}:*)`);
   });
 
   it("allows the absolute spelling when the interpreter sits outside the repository", () => {
