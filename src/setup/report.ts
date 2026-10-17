@@ -2,7 +2,7 @@ import { join, relative, sep } from "node:path";
 import { writeFileSecure } from "../util/secureFile.js";
 import { applicationEnvKeys } from "./envWrite.js";
 import { isThinTrace, spanPhrase, thinTraceFinding } from "./trace.js";
-import type { SetupContext } from "./types.js";
+import type { ApplicationKeyLocation, SetupContext } from "./types.js";
 
 /**
  * The record a setup run leaves behind.
@@ -71,12 +71,36 @@ function line(label: string, value: string | null | undefined): string {
  * which is the same rule the checkpoint follows — a report is a file people
  * paste into pull requests, which is the last place a secret should be able to
  * reach.
+ *
+ * `keyLocation` is where the key sits on this machine — see
+ * {@link ApplicationKeyLocation}. Optional because the context alone answers
+ * the question for every run that wrote a file, and a caller that has no run's
+ * deps to hand gets that answer. A caller that does should pass
+ * `applicationKeyLocation`, which is the only thing that can tell a key already
+ * in the project's own `.env` from a key in no file at all: that run skips
+ * `configure_repository` entirely, so `credentialEnvFile` stays unset over a
+ * file the application genuinely loads.
  */
-export function renderSetupReport(ctx: SetupContext, now: Date): string {
+export function renderSetupReport(
+  ctx: SetupContext,
+  now: Date,
+  keyLocation?: ApplicationKeyLocation,
+): string {
   const cp = ctx.checkpoint;
   const service = cp.service;
   const app = ctx.application;
   const trace = ctx.trace;
+  // The file to copy the value out of, or null when there is no file to name.
+  // `relativeToRoot` has already made the location's path root-relative with
+  // `/` separators, which is what the fallback does for itself.
+  const keyFile =
+    keyLocation === undefined
+      ? ctx.credentialEnvFile === undefined
+        ? null
+        : slashPath(relative(ctx.root, ctx.credentialEnvFile))
+      : keyLocation.kind === "file"
+        ? keyLocation.path
+        : null;
 
   // Three answers rather than two, because "a trace has been received" is true
   // of a trace that covers one function and reads as though it covers the
@@ -210,8 +234,14 @@ export function renderSetupReport(ctx: SetupContext, now: Date): string {
     // Where to copy it from, and only when there is somewhere. A run that wrote
     // no file has nothing to point at, and pointing anyway is what sends a
     // reader looking for a file the repository does not contain.
-    ctx.credentialEnvFile !== undefined
-      ? `The value is in \`${cell(slashPath(relative(ctx.root, ctx.credentialEnvFile)))}\`, which stays on this machine — nothing in the repository carries it.`
+    //
+    // "Wrote no file" and "has nowhere to point" are not the same run, which is
+    // why this asks the key's location rather than the file this run wrote: a
+    // key already in the project's own `.env` is in the file the application
+    // loads, and saying nothing carries it would be false about the file the
+    // reader is most likely to already have open.
+    keyFile !== null
+      ? `The value is in \`${cell(keyFile)}\`, which stays on this machine — nothing in the repository carries it.`
       : "This run wrote the value to no file in the project, so nothing here carries it.",
     "",
   ];
@@ -226,14 +256,18 @@ export function renderSetupReport(ctx: SetupContext, now: Date): string {
  * application and saw a trace has succeeded, and failing it at the last step
  * over a file nobody has read yet would be absurd.
  */
-export function writeSetupReport(ctx: SetupContext, now: Date = new Date()): string | null {
+export function writeSetupReport(
+  ctx: SetupContext,
+  now: Date = new Date(),
+  keyLocation?: ApplicationKeyLocation,
+): string | null {
   const target = join(ctx.root, REPORT_PATH);
   try {
     // Creates `.traceroot/` 0700, writes a fresh temp file exclusively and
     // renames it into place, so a symlink planted at the report's path is
     // replaced rather than written through. Also makes the write atomic and
     // leaves the file 0600, which is right for something in a 0700 directory.
-    writeFileSecure(target, renderSetupReport(ctx, now));
+    writeFileSecure(target, renderSetupReport(ctx, now, keyLocation));
     return REPORT_PATH;
   } catch {
     return null;

@@ -291,6 +291,32 @@ describe("what the report says production still needs", () => {
     expect(section(text)).not.toContain("The value is in");
   });
 
+  it("points at the project's own file when the run wrote none itself", () => {
+    // The run that wrote no file is not always the run with nowhere to point: a
+    // key already in the project's `.env` skips `configure_repository`
+    // entirely, so `credentialEnvFile` stays unset over the very file the
+    // application loads. The location is what knows the difference, and the
+    // report has to say where the value is.
+    const text = renderSetupReport(hosted(), NOW, { kind: "file", path: ".env" });
+
+    expect(section(text)).toContain("The value is in `.env`, which stays on this machine");
+    expect(section(text)).not.toContain("wrote the value to no file");
+    // Still not in the files-touched table, because this run touched no file.
+    expect(text).not.toContain("| `.env` |");
+  });
+
+  it("points at no file when the key reached none, refusal included", () => {
+    for (const location of [
+      { kind: "environment" } as const,
+      { kind: "refused", path: ".env" } as const,
+    ]) {
+      const text = renderSetupReport(hosted(), NOW, location);
+
+      expect(section(text)).toContain("This run wrote the value to no file in the project");
+      expect(section(text)).not.toContain("The value is in");
+    }
+  });
+
   it("names the variable and never a value", () => {
     // Same rule as the key row, and worth pinning here because this section is
     // about carrying a secret somewhere: the hint is the only key-shaped string

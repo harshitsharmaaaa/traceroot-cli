@@ -1998,8 +1998,13 @@ describe("where the application's key ended up", () => {
     const deps = depsFor(authFrom("config"));
     const { ctx } = makeCtx({ flags: { agent: "claude" } });
 
-    await runSetupMachine(ctx, deps);
+    const result = await runSetupMachine(ctx, deps);
 
+    // The run has to have reached `configure_repository` for the answer to mean
+    // anything. Two of the cases below are what the fallback returns from an
+    // untouched context, so a pipeline that failed at stage one would answer
+    // them correctly by accident.
+    expect(result.error).toBeNull();
     expect(applicationKeyLocation(ctx, deps)).toEqual({ kind: "file", path: ".env" });
   });
 
@@ -2014,8 +2019,9 @@ describe("where the application's key ended up", () => {
     const deps = depsFor(authFrom("auto-env-file"));
     const { ctx } = makeCtx({ flags: { agent: "claude" } });
 
-    await runSetupMachine(ctx, deps);
+    const result = await runSetupMachine(ctx, deps);
 
+    expect(result.error).toBeNull();
     expect(ctx.credentialEnvFile).toBeUndefined();
     expect(applicationKeyLocation(ctx, deps)).toEqual({ kind: "file", path: ".env" });
   });
@@ -2026,8 +2032,9 @@ describe("where the application's key ended up", () => {
     const deps = depsFor(authFrom("env"), { PATH: "/usr/bin", TRACEROOT_API_KEY: KEY });
     const { ctx } = makeCtx({ flags: { agent: "claude" } });
 
-    await runSetupMachine(ctx, deps);
+    const result = await runSetupMachine(ctx, deps);
 
+    expect(result.error).toBeNull();
     expect(existsSync(join(dir, ".env"))).toBe(false);
     expect(applicationKeyLocation(ctx, deps)).toEqual({ kind: "environment" });
   });
@@ -2049,8 +2056,11 @@ describe("where the application's key ended up", () => {
     }).run;
     const { ctx } = makeCtx({ flags: { agent: "claude" } });
 
-    await runSetupMachine(ctx, deps);
+    const result = await runSetupMachine(ctx, deps);
 
+    // The refusal degrades rather than fails: the child environment handoff
+    // still works, so the run goes on to the trace.
+    expect(result.error).toBeNull();
     expect(readFileSync(join(dir, ".env"), "utf8")).toBe("# committed by mistake\n");
     expect(ctx.refusedCredentialEnvFile).toBe(join(dir, ".env"));
     expect(applicationKeyLocation(ctx, deps)).toEqual({ kind: "refused", path: ".env" });

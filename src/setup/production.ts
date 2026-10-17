@@ -166,12 +166,19 @@ function footnote(
     // What the user needs is where to copy it from, and the answer is "here".
     return `This run read ${KEY_ENV} from your own environment rather than writing it to a file, so the value to copy is the one already set on this machine.`;
   }
-  // The refusal, and the only case where there is nothing anywhere to copy. The
-  // key was never printed — it goes into the child's environment and into a
-  // file, and this run got neither — so sending the user to look for it would
-  // be sending them after a value that no longer exists. A key of its own for
-  // the deployment is the honest instruction, and it is also the better one.
-  return `Nothing on this machine holds ${KEY_ENV}: ${wizardEmphasis(location.path)} is tracked by git, so this run did not write the key into it. Give your deployment a key of its own.`;
+  // The refusal, and the only case where no file holds the key. It was never
+  // printed: it goes into the child's environment, which went with the child,
+  // and into a file, and this run wrote none — so sending the user to a path
+  // would be sending them to a file the repository does not have. A key of its
+  // own for the deployment is the honest instruction, and it is also the better
+  // one.
+  //
+  // What it does not claim is that the value is nowhere on this machine. It
+  // said that, and the run that reaches this branch from a key in the CLI's own
+  // config — or from a shell that exports a stale `TRACEROOT_API_KEY` — can
+  // read the sentence and see it is false. The file is the part this run can
+  // speak for.
+  return `This run wrote ${KEY_ENV} to no file in the project: ${wizardEmphasis(location.path)} is tracked by git, so the key was not written into it. Give your deployment a key of its own.`;
 }
 
 /**

@@ -3629,7 +3629,10 @@ const complete: StageDefinition = {
     // Written, not announced. The report is there for whoever goes looking
     // after the fact; saying so on the last screen spends the user's attention
     // on a file they did not ask for, one line above the thing they did.
-    writeSetupReport(ctx, deps.now());
+    // The key's location rather than the file this run wrote: the report has
+    // to point the reader at the value, and a key already in the project's own
+    // `.env` skipped the stage that records one. See {@link applicationKeyLocation}.
+    writeSetupReport(ctx, deps.now(), applicationKeyLocation(ctx, deps));
     return "ok";
   },
 };
