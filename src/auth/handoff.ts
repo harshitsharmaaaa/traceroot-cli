@@ -82,7 +82,7 @@ export async function redeemHandoff(opts: HandoffRedeemOptions): Promise<Handoff
   const base = normalizeBaseUrl(opts.authHost);
   const code = opts.code.trim();
   if (code === "") {
-    throw new CliError("--handoff needs a handoff code", ExitCode.usage);
+    throw new CliError("--handoff needs a code", ExitCode.usage);
   }
 
   // Never echo the code: a runtime error can quote the request it failed on,

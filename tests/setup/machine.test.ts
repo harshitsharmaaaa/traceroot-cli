@@ -1075,10 +1075,13 @@ describe("the handoff code from browser-first onboarding", () => {
   /**
    * A whole run reached through `--handoff`, with everything the stage touches
    * recorded: the credentials written, the session tokens handed to the token
-   * mint, the redemptions attempted, and whether the device flow was used.
+   * mint, the redemptions attempted, whether the device flow was used, and
+   * every process the run launched — the agent among them, which is what the
+   * code has to have stayed out of.
    */
   function handoffRun(options: HandoffRun = {}) {
     pythonRepo();
+    const launched = fakeRunProcess({ gitStatus: ["", " M main.py"] });
     const written: CredentialEntry[] = [];
     const minted: string[] = [];
     const redeemed: Array<{ authHost: string; code: string }> = [];
@@ -1100,7 +1103,7 @@ describe("the handoff code from browser-first onboarding", () => {
       auth: options.auth ?? authEmpty(),
       setupApi: projectApi(),
       client,
-      runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
+      runProcess: launched.run,
       storedCredential: options.stored ?? null,
       onWriteCredential: (_host, entry) => written.push(entry),
       runDeviceFlow: async () => {
@@ -1142,6 +1145,7 @@ describe("the handoff code from browser-first onboarding", () => {
       minted,
       redeemed,
       keysUsed,
+      launched: launched.runs,
       deviceFlows: () => deviceFlows,
     };
   }
@@ -1286,7 +1290,7 @@ describe("the handoff code from browser-first onboarding", () => {
     expect(run.written.map((e) => e.session_token)).toEqual(["handoff-session-token"]);
     // …and `writeCredential` replaced the stored entry, so the run says so.
     expect(said(run.err.data)).toContain(
-      "Signed in as alice@old.example; this handoff is for bob@new.example — switching.",
+      "Signed in as alice@old.example; the code from the browser is for bob@new.example — switching.",
     );
   });
 
@@ -1317,7 +1321,7 @@ describe("the handoff code from browser-first onboarding", () => {
 
     expect(result.ok).toBe(true);
     expect(said(run.err.data)).toContain(
-      "Signed in as bob@new.example; this handoff replaced the TraceRoot sign-in already saved on this machine.",
+      "Signed in as bob@new.example; the sign-in code from the browser replaced the TraceRoot sign-in already saved on this machine.",
     );
   });
 
@@ -1432,14 +1436,36 @@ describe("the handoff code from browser-first onboarding", () => {
     expect(text).toContain("Signed in with the TraceRoot credential already configured.");
   });
 
-  it("redeems the code before any coding agent could read it", () => {
+  it("redeems the code before any coding agent could read it", async () => {
     // A handoff code is live until it is redeemed, and `instrument` hands a
     // coding agent a shell in the user's repository — one that can read shell
     // history and run `ps`. That the code is already spent by then is a
     // property of stage ORDER, which a later reshuffle could quietly break.
+    //
+    // Asserted against a run, not between two constants: the order says when
+    // the redemption happens and nothing about whether the code itself reached
+    // the agent's process, which is the leak the order exists to prevent. So
+    // the run is made and the launch is read — its environment, its arguments
+    // and its stdin.
+    const run = handoffRun();
+    const result = await runSetupMachine(run.ctx, run.deps);
+
+    expect(result.ok).toBe(true);
     const order = SETUP_PIPELINE.map((definition) => definition.stage);
     expect(order).toEqual([...SETUP_STAGES]);
     expect(order.indexOf("authenticate")).toBeLessThan(order.indexOf("instrument"));
+    // Spent, once, before any of that.
+    expect(run.redeemed).toEqual([{ authHost: "https://api.example.test", code: CODE }]);
+
+    // An agent really did launch, so what follows is about a process that
+    // exists rather than an empty list quietly satisfying every assertion.
+    const launches = run.launched.filter((launch) => launch.program === "claude");
+    expect(launches).toHaveLength(1);
+    for (const launch of launches) {
+      expect(JSON.stringify(launch.env)).not.toContain(CODE);
+      expect(launch.args.join(" ")).not.toContain(CODE);
+      expect(launch.stdin ?? "").not.toContain(CODE);
+    }
   });
 });
 

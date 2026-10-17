@@ -215,10 +215,19 @@ describe("redeemHandoff", () => {
     expect((err as CliError).message).toContain("malformed");
   });
 
-  it("rejects a malformed auth host as a usage error", async () => {
-    const err = await caught(() => redeemHandoff({ authHost: "not a url", code: CODE }));
+  it("rejects a malformed auth host as a usage error before any request", async () => {
+    // The fake is injected and asserted unused, as the empty-code test below
+    // does. Without it this is the one test in the file that falls back to the
+    // real `globalThis.fetch`, and it stays off the network only because
+    // `normalizeBaseUrl` happens to throw first — a property of the code under
+    // test, which is the thing a test must not take for granted.
+    const fake = createFakeFetch(() => jsonResponse({ sessionToken: "sess-1" }));
+    const err = await caught(() =>
+      redeemHandoff({ authHost: "not a url", code: CODE, fetchImpl: fake.fetchImpl }),
+    );
     expect(err).toBeInstanceOf(CliError);
     expect((err as CliError).exitCode).toBe(ExitCode.usage);
+    expect(fake.calls).toHaveLength(0);
   });
 
   it("rejects an empty code as a usage error before any request", async () => {

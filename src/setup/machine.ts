@@ -800,12 +800,12 @@ function accountSwitchLine(
   }
   const signedIn = email === undefined ? "Signed in" : `Signed in as ${wizardValue(email)}`;
   if (previous.email === undefined || email === undefined) {
-    return `${signedIn}; this handoff replaced the TraceRoot sign-in already saved on this machine.`;
+    return `${signedIn}; the sign-in code from the browser replaced the TraceRoot sign-in already saved on this machine.`;
   }
   if (previous.email === email) {
     return undefined;
   }
-  return `Signed in as ${wizardValue(previous.email)}; this handoff is for ${wizardValue(email)} — switching.`;
+  return `Signed in as ${wizardValue(previous.email)}; the code from the browser is for ${wizardValue(email)} — switching.`;
 }
 
 /**
@@ -884,7 +884,7 @@ async function handoffSignIn(
     throw new SetupError({
       stage: "authenticate",
       code: "NOT_AUTHENTICATED",
-      message: "The credential from the browser handoff was rejected immediately.",
+      message: "The sign-in from the browser was not accepted.",
       remedy: "Run `traceroot setup` again.",
     });
   }
