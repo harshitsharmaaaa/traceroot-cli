@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
 import { displaySkillPath, requireAgent } from "../agents/index.js";
+import type { AgentAdapter } from "../agents/types.js";
 import { type ApiClient, type ApiClientOptions, createApiClient } from "../api/client.js";
 import {
   BackendUnavailableError,
@@ -40,7 +41,7 @@ import { bundledSkillDir } from "../skills/bundled.js";
 import { installBundledSkill } from "../skills/install.js";
 import { sleep } from "../util/sleep.js";
 import { createActivityParser } from "./activity.js";
-import { detectAgents, selectAgent } from "./agents.js";
+import { detectAgents, detectConfiguredAgents, selectAgent } from "./agents.js";
 import { relativeToRoot } from "./artifacts.js";
 import { hasCompleted, markComplete, writeCheckpoint } from "./checkpoint.js";
 import {
@@ -2089,22 +2090,121 @@ interface InstrumentationChoice {
 }
 
 /**
- * The agent id a route that runs nothing still needs.
+ * An adapter as the agent record a route that launches nothing still needs.
  *
- * `task-file` and `manual` both render a skill path, and a skill path is
- * per-agent — so an agent has to be named even though none will be launched.
  * `runnable: false` is the load-bearing part: nothing downstream may mistake
  * this for a binary that exists.
  */
-function unlaunchedAgent(ctx: SetupContext): DetectedAgent {
-  const adapter = requireAgent(ctx.flags.agent ?? "claude");
+function unlaunchedAgent(adapter: AgentAdapter, configured: boolean): DetectedAgent {
   return {
     id: adapter.id,
     displayName: adapter.displayName,
     runnable: false,
-    configured: false,
+    configured,
     evidence: [],
   };
+}
+
+/**
+ * The agent a hand-over route targets.
+ *
+ * `task-file` and `manual` both render a skill path and install the skill, and
+ * both are per-agent — so an agent has to be named even though none will be
+ * launched. It used to be named as `--agent` or else Claude Code, which made
+ * the narrowness of `LAUNCHABLE_AGENTS` leak somewhere it has no business
+ * being: that list exists because driving an agent headless needs an
+ * environment this CLI controls, and this route drives nothing. A machine with
+ * both `~/.codex` and `~/.claude` was told to run the task in Claude Code and
+ * never heard Codex mentioned, and the skill went to `.claude/skills/` whatever
+ * the user actually runs.
+ *
+ * So the agents *present* decide, through each adapter's own `detect` — which
+ * is also what keeps Codex's global `$CODEX_HOME/skills` out of Claude Code's
+ * project-local `.claude/skills`. The ladder is the one the rest of the CLI
+ * uses: an explicit flag wins, one agent auto-selects, several ask when there
+ * is somebody to ask, and none is not an error here — the markdown task is
+ * self-contained, so it goes to the tool-neutral `.agents/skills/` location and
+ * the wording stops naming a product nobody has.
+ */
+async function handoverAgent(ctx: SetupContext, deps: SetupDeps): Promise<DetectedAgent> {
+  // Validated against the whole registry rather than the launchable list:
+  // nothing is run, so "setup cannot drive that one" is not a reason to refuse
+  // to write its task out.
+  if (ctx.flags.agent !== undefined) {
+    return unlaunchedAgent(requireAgent(ctx.flags.agent), true);
+  }
+
+  const present = detectConfiguredAgents(ctx.root);
+  const first = present[0];
+  if (first === undefined) {
+    return unlaunchedAgent(requireAgent("generic"), false);
+  }
+  if (present.length === 1) {
+    return unlaunchedAgent(first, true);
+  }
+
+  if (!ctx.canPrompt) {
+    // No question, and not a word of one: `--json` owns stdout for its event
+    // stream and a CI job has nobody to read a prompt. The registry's order
+    // decides, and the run then *reports* the decision and the flag that
+    // changes it — output after the fact, not a prompt.
+    wizardProgress(
+      ctx,
+      `Agents set up here: ${present.map((a) => a.displayName).join(", ")}. Targeting ${first.displayName}; rerun with \`--agent <id>\` to target another.`,
+    );
+    return unlaunchedAgent(first, true);
+  }
+
+  const chosenId = await deps.select({
+    stage: "select_agent",
+    message: "Which coding agent will you run the task in?",
+    options: present.map((adapter) => ({
+      value: adapter.id,
+      label: adapter.displayName,
+      // Where its copy of the skill lands, because that is the one consequence
+      // of this answer and it is not the same kind of place for each agent:
+      // Claude Code reads a directory in this repository, Codex one in the
+      // user's home.
+      hint: displaySkillPath(ctx.root, adapter.getSkillInstallPath(ctx.root, SKILL_NAME)),
+    })),
+  });
+  const chosen = present.find((adapter) => adapter.id === chosenId);
+  if (chosen === undefined) {
+    throw new SetupError({
+      stage: "select_agent",
+      code: "AMBIGUOUS",
+      message: `'${chosenId}' is not one of the agents set up here.`,
+    });
+  }
+  return unlaunchedAgent(chosen, true);
+}
+
+/**
+ * The agent to name on a hand-over, or null when naming one would be a fiction.
+ *
+ * `generic` is the registry's entry for "no particular agent" — its display
+ * name is "Agent (generic)", which is a category and not somewhere a user can
+ * go and open a file.
+ */
+function handoverAgentName(ctx: SetupContext): string | null {
+  const agent = ctx.agent;
+  return agent === undefined || agent.id === "generic" ? null : agent.displayName;
+}
+
+/**
+ * "Run it in Codex", or — when nothing was found to name — a sentence that says
+ * the task works anywhere rather than dead-ending on an agent the user has not
+ * got. `subject` is whatever reads best where it is used: "it" straight after
+ * the line that named the file, the path itself where nothing has.
+ *
+ * Shared by the hand-over itself and by the trace stage that has to repeat it,
+ * so the two cannot come to disagree about where the task is supposed to run.
+ */
+function runTaskSentence(ctx: SetupContext, subject: string): string {
+  const name = handoverAgentName(ctx);
+  return name === null
+    ? `No coding agent is set up here, but the task is self-contained — run ${subject} in whichever agent you use`
+    : `Run ${subject} in ${name}`;
 }
 
 /**
@@ -2151,18 +2251,18 @@ async function chooseInstrumentation(
   if (ctx.flags.method !== undefined) {
     return ctx.flags.method === "agent"
       ? await withAgent()
-      : { method: ctx.flags.method, agent: unlaunchedAgent(ctx) };
+      : { method: ctx.flags.method, agent: await handoverAgent(ctx, deps) };
   }
   // `--no-instrument` predates the three-way choice and means "do not run one".
   if (!ctx.flags.instrument) {
-    return { method: "task-file", agent: unlaunchedAgent(ctx) };
+    return { method: "task-file", agent: await handoverAgent(ctx, deps) };
   }
   // An explicit `--agent` is an unambiguous request to launch that agent.
   if (ctx.flags.agent !== undefined) {
     return await withAgent();
   }
   if (!ctx.canPrompt) {
-    return { method: "task-file", agent: unlaunchedAgent(ctx) };
+    return { method: "task-file", agent: await handoverAgent(ctx, deps) };
   }
 
   const runnable = detected.filter((agent) => agent.runnable);
@@ -2191,7 +2291,7 @@ async function chooseInstrumentation(
       message: `'${answer}' is not one of the offered ways to instrument this service.`,
     });
   }
-  return { method: answer, agent: unlaunchedAgent(ctx) };
+  return { method: answer, agent: await handoverAgent(ctx, deps) };
 }
 
 // ── INSTALL_AGENT_CONTEXT ───────────────────────────────────────────────────
@@ -2442,7 +2542,7 @@ const instrument: StageDefinition = {
       };
       wizardLine(
         ctx,
-        `\nWrote the instrumentation task to ${displaySkillPath(ctx.root, promptPath)}.\nRun it in ${adapter.displayName}, then rerun \`traceroot setup --resume\`.`,
+        `\nWrote the instrumentation task to ${displaySkillPath(ctx.root, promptPath)}.\n${runTaskSentence(ctx, "it")}, then rerun \`traceroot setup --resume\`.`,
       );
       return "skipped";
     }

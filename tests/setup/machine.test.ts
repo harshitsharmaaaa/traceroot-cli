@@ -50,12 +50,27 @@ import {
 } from "./helpers.js";
 
 let dir: string;
+let prevCodexHome: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "tr-setup-machine-"));
+  // Codex's skills directory is global, not project-local: it is read from
+  // `$CODEX_HOME`, falling back to the real `~/.codex`. A hand-over route that
+  // targets Codex installs the skill there, so leaving this unpinned makes the
+  // suite's behaviour depend on whether the developer running it happens to
+  // use Codex — and, worse, writes into their home directory. Pointed at the
+  // fixture, the same way `doctor` and `skills` already do.
+  prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = join(dir, "codex-home");
 });
 
 afterEach(() => {
+  if (prevCodexHome === undefined) {
+    // biome-ignore lint/performance/noDelete: restoring an env var; assigning undefined would stringify it
+    delete process.env.CODEX_HOME;
+  } else {
+    process.env.CODEX_HOME = prevCodexHome;
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -3441,6 +3456,189 @@ describe("--no-instrument", () => {
     // It did not reach a trace, so it must not print the completion sentence.
     expect(out.data).not.toContain("TraceRoot is connected");
     expect(result.error?.code).toBe("TRACE_TIMEOUT");
+  });
+});
+
+describe("the agent a hand-over targets", () => {
+  /** `.claude/` in the project, which is what Claude Code's adapter looks for. */
+  function withClaudeConfigured(): void {
+    mkdirSync(join(dir, ".claude"), { recursive: true });
+  }
+
+  /** `$CODEX_HOME`, pinned into the fixture by the suite's `beforeEach`. */
+  function withCodexConfigured(): string {
+    const home = join(dir, "codex-home");
+    mkdirSync(home, { recursive: true });
+    return home;
+  }
+
+  /** Records every question asked, so "it did not ask" is assertable. */
+  function askRecorder(deps: SetupDeps): {
+    deps: SetupDeps;
+    asked: Array<{ message: string; options: string[] }>;
+  } {
+    const asked: Array<{ message: string; options: string[] }> = [];
+    const inner = deps.select;
+    return {
+      asked,
+      deps: {
+        ...deps,
+        select: async (input) => {
+          asked.push({ message: input.message, options: input.options.map((o) => o.value) });
+          return inner(input);
+        },
+      },
+    };
+  }
+
+  /** A hand-over run: writes the task, edits nothing, stops short of a trace. */
+  function handoverDeps(answers: string[] = []): SetupDeps {
+    return makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [] }),
+      runProcess: fakeRunProcess().run,
+      answers,
+    });
+  }
+
+  const skillInstalled = (...parts: string[]): boolean =>
+    existsSync(join(...parts, "traceroot-instrument-repo", "SKILL.md"));
+
+  it("names Codex, and installs the skill in Codex's own directory", async () => {
+    // The route that writes a markdown task out drives nothing, so the
+    // launchable-agent list has no business narrowing it. This machine has
+    // Codex and not Claude Code; being told to run the task in Claude Code is
+    // advice about software that is not here.
+    pythonRepo();
+    const codexHome = withCodexConfigured();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+    await runSetupMachine(ctx, handoverDeps());
+
+    const said = plain(err.data);
+    expect(said).toContain("Run it in Codex");
+    expect(said).not.toContain("Claude Code");
+    expect(ctx.agent?.id).toBe("codex");
+    // Codex reads skills from the home directory, not from the repository, so
+    // "the right agent" has to mean its path and not merely its name.
+    expect(skillInstalled(codexHome, "skills")).toBe(true);
+    expect(skillInstalled(dir, ".claude", "skills")).toBe(false);
+  });
+
+  it("names Claude Code when that is what is set up", async () => {
+    pythonRepo();
+    withClaudeConfigured();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+    await runSetupMachine(ctx, handoverDeps());
+
+    const said = plain(err.data);
+    expect(said).toContain("Run it in Claude Code");
+    expect(said).not.toContain("Codex");
+    expect(ctx.agent?.id).toBe("claude");
+    expect(skillInstalled(dir, ".claude", "skills")).toBe(true);
+  });
+
+  it("asks which one when both are set up, and honours the answer", async () => {
+    pythonRepo();
+    withClaudeConfigured();
+    const codexHome = withCodexConfigured();
+    const { deps, asked } = askRecorder(handoverDeps(["codex"]));
+    const { ctx, err } = makeCtx({
+      canPrompt: true,
+      flags: { instrument: false, traceTimeoutSec: 1 },
+    });
+
+    await runSetupMachine(ctx, deps);
+
+    const question = asked.find((q) => q.message.includes("Which coding agent"));
+    expect(question?.options).toEqual(["claude", "codex"]);
+    expect(ctx.agent?.id).toBe("codex");
+    expect(plain(err.data)).toContain("Run it in Codex");
+    expect(skillInstalled(codexHome, "skills")).toBe(true);
+  });
+
+  it("never asks when it cannot, and says what it picked and how to change it", async () => {
+    // A `--json` consumer and a CI job have nobody to answer a question, and
+    // stdout there belongs to the event stream — so the choice is reported
+    // after the fact rather than put to the user.
+    pythonRepo();
+    withClaudeConfigured();
+    withCodexConfigured();
+    const { deps, asked } = askRecorder(handoverDeps());
+    const { ctx, err } = makeCtx({
+      canPrompt: false,
+      flags: { instrument: false, traceTimeoutSec: 1 },
+    });
+
+    await runSetupMachine(ctx, deps);
+
+    expect(asked.filter((q) => q.message.includes("Which coding agent"))).toEqual([]);
+    const said = plain(err.data);
+    // Both are named, so the one it did not pick is not invisible.
+    expect(said).toContain("Agents set up here: Claude Code, Codex");
+    expect(said).toContain("Targeting Claude Code");
+    expect(said).toContain("--agent");
+    // And not a word of the question itself.
+    expect(said).not.toContain("Which coding agent");
+    expect(ctx.agent?.id).toBe("claude");
+  });
+
+  it("keeps the choice out of a --json run's event stream", async () => {
+    pythonRepo();
+    withClaudeConfigured();
+    withCodexConfigured();
+    const { deps, asked } = askRecorder(handoverDeps());
+    const { ctx, out } = makeCtx({
+      json: true,
+      flags: { instrument: false, traceTimeoutSec: 1 },
+    });
+
+    await runSetupMachine(ctx, deps);
+
+    expect(asked).toEqual([]);
+    // stdout belongs to the event stream; the note about what was targeted is
+    // stderr, like every other thing the run says about itself.
+    expect(plain(out.data)).not.toContain("Which coding agent");
+    expect(plain(out.data)).not.toContain("Agents set up here");
+    expect(ctx.agent?.id).toBe("claude");
+  });
+
+  it("still writes a useful task when no agent is set up at all", async () => {
+    // Not a dead end: the markdown is self-contained, so the run says so and
+    // puts the skill in the tool-neutral location rather than naming a product
+    // this machine has not got.
+    pythonRepo();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+    await runSetupMachine(ctx, handoverDeps());
+
+    const taskPath = join(dir, ".traceroot", "prompts", "setup-instrument.md");
+    expect(readFileSync(taskPath, "utf8")).toContain("Instrument this service with TraceRoot");
+    const said = plain(err.data);
+    expect(said).toContain("No coding agent is set up here");
+    expect(said).toContain("run it in whichever agent you use");
+    expect(said).not.toContain("Run it in Claude Code");
+    expect(ctx.agent?.id).toBe("generic");
+    expect(skillInstalled(dir, ".agents", "skills")).toBe(true);
+  });
+
+  it("obeys --agent over what is on the machine", async () => {
+    pythonRepo();
+    withClaudeConfigured();
+    const codexHome = join(dir, "codex-home");
+    const { deps, asked } = askRecorder(handoverDeps());
+    const { ctx, err } = makeCtx({
+      canPrompt: true,
+      flags: { agent: "codex", instrument: false, traceTimeoutSec: 1 },
+    });
+
+    await runSetupMachine(ctx, deps);
+
+    expect(asked.filter((q) => q.message.includes("Which coding agent"))).toEqual([]);
+    expect(ctx.agent?.id).toBe("codex");
+    expect(plain(err.data)).toContain("Run it in Codex");
+    expect(skillInstalled(codexHome, "skills")).toBe(true);
   });
 });
 
