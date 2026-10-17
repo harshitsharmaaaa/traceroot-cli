@@ -3144,12 +3144,37 @@ const verifyTrace: StageDefinition = {
     // still have run the code itself while instrumenting, so this takes one
     // look before giving up rather than assuming.
     const somethingRan = ctx.application?.withCredentials.ran === true;
-    const timeoutMs = somethingRan ? ctx.flags.traceTimeoutSec * 1000 : 0;
+
+    // A hand-over that nothing has acted on: a second way for a trace to be
+    // impossible, and the more fundamental of the two.
+    //
+    // `--no-instrument`, `--manual` and the task-file answer all leave the
+    // repository exactly as they found it, and the stage that did so recorded
+    // that as `mode: "prompt-only"` — read here rather than re-derived, because
+    // the branch that hands over is the only thing that knows it did.
+    //
+    // Whether that leaves the service uninstrumented is the other half, and
+    // `detect_stack` already answered it: `existingInstrumentation.present` is
+    // an actual `initialize()` call in the entry point, measured before the
+    // hand-over. A hand-over changes no code, so on this route that reading is
+    // still current — and a repository the user had instrumented by hand before
+    // running setup is therefore not caught by this, which is the point. It
+    // still gets its full wait and its verification.
+    const handover = ctx.instrumentation?.mode === "prompt-only" ? ctx.instrumentation : null;
+    const unrunHandover =
+      handover !== null && ctx.stack?.existingInstrumentation.present !== true ? handover : null;
+
+    // Both impossibilities, not just the first: an uninstrumented application
+    // emits nothing however many times its test suite runs it, so there is no
+    // more reason to wait out the timeout here than there is when nothing ran
+    // at all. One look either way, in case a trace is already there.
+    const couldArrive = somethingRan && unrunHandover === null;
+    const timeoutMs = couldArrive ? ctx.flags.traceTimeoutSec * 1000 : 0;
     // The other long unattended wait. Nothing arrives to report on until the
     // trace does, so the elapsed counter is the whole of what a user can be
     // told — and it is the difference between waiting and suspecting a hang.
     const waiting =
-      ctx.json || !somethingRan
+      ctx.json || !couldArrive
         ? null
         : startLineSpinner({
             sink: ctx.writers.err,
@@ -3183,6 +3208,37 @@ const verifyTrace: StageDefinition = {
     waiting?.stop(
       outcome.found ? received : `No trace after ${Math.round(outcome.waitedMs / 1000)}s.`,
     );
+
+    if (!outcome.found && unrunHandover !== null) {
+      // Named before "nothing ran it", because it is the cause underneath it.
+      //
+      // This route reported a missing trace as "nothing has run your
+      // application", which sent the user off to run an application that has
+      // no TraceRoot in it — a loop that cannot terminate, since running it
+      // again produces the same nothing. The instrumentation itself is what is
+      // outstanding, and the instruction for it is the one this run printed a
+      // few lines earlier.
+      const task =
+        unrunHandover.promptPath === null
+          ? null
+          : displaySkillPath(ctx.root, unrunHandover.promptPath);
+      throw new PausedSetupError({
+        stage: "verify_trace",
+        code: "TRACE_TIMEOUT",
+        message: [
+          "No trace yet, and this service is not instrumented:",
+          task === null
+            ? "setup printed the manual instructions and changed no code itself,"
+            : `setup wrote the instrumentation task to ${task} and changed no code itself,`,
+          "and there is no TraceRoot initialization in it yet.",
+          "An uninstrumented application emits nothing, however often it runs.",
+        ].join(" "),
+        remedy:
+          task === null
+            ? ["Apply the steps above, then:", "  traceroot setup --resume"].join("\n")
+            : [`${runTaskSentence(ctx, task)}, then:`, "  traceroot setup --resume"].join("\n"),
+      });
+    }
 
     if (!outcome.found && !somethingRan) {
       // Say the actual reason rather than reporting a timeout that never

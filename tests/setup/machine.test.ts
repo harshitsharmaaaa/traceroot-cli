@@ -3642,6 +3642,118 @@ describe("the agent a hand-over targets", () => {
   });
 });
 
+describe("why no trace arrived", () => {
+  /** A Python service with no test or health command for setup to run. */
+  function pythonRepoWithoutTests(): void {
+    writeFileSync(join(dir, "pyproject.toml"), '[project]\ndependencies = ["fastapi"]\n');
+    writeFileSync(join(dir, "main.py"), "print('hi')\n");
+  }
+
+  /** The same service, already wired up by hand before setup ever ran. */
+  function alreadyInstrumented(): void {
+    writeFileSync(
+      join(dir, "main.py"),
+      'import traceroot\n\nif __name__ == "__main__":\n    traceroot.initialize()\n',
+    );
+  }
+
+  function traceless(): SetupDeps {
+    return makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [] }),
+      runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
+    });
+  }
+
+  it("blames the missing instrumentation, not a program that never ran", async () => {
+    // The live failure. `main.py` held zero TraceRoot references and the SDK
+    // was not installed, and the run said "nothing has run your application —
+    // Run your application once". Running an uninstrumented application again
+    // produces the same nothing, so that advice is a loop with no exit; what
+    // is outstanding is the instrumentation itself.
+    pythonRepoWithoutTests();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 120 } });
+
+    const result = await runSetupMachine(ctx, traceless());
+
+    expect(result.error?.code).toBe("TRACE_TIMEOUT");
+    const message = plain(result.error?.message ?? "");
+    expect(message).toContain("this service is not instrumented");
+    expect(message).toContain(".traceroot/prompts/setup-instrument.md");
+    expect(message).not.toContain("nothing has run your application");
+    // And the remedy is the one the wizard printed a few lines earlier.
+    const remedy = plain(result.error?.remedy ?? "");
+    expect(remedy).toContain(".traceroot/prompts/setup-instrument.md");
+    expect(remedy).toContain("traceroot setup --resume");
+    expect(remedy).not.toContain("Run your application once");
+    // Nothing can arrive, so nothing is waited for: no two-minute spinner in
+    // front of an answer that was available immediately.
+    expect(plain(err.data)).not.toContain("Waiting for your first trace");
+  });
+
+  it("says the same thing when the project's own suite did run", async () => {
+    // A test command exercising uninstrumented code is still uninstrumented
+    // code: "the instrumented code path never ran" would name the wrong one of
+    // the two missing halves.
+    pythonRepo();
+    const { ctx } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 120 } });
+
+    const result = await runSetupMachine(ctx, traceless());
+
+    expect(ctx.application?.withCredentials.ran).toBe(true);
+    expect(plain(result.error?.message ?? "")).toContain("this service is not instrumented");
+  });
+
+  it("points at the printed steps rather than a file on the manual route", async () => {
+    // `--manual` writes no task file, so there is no path to send anyone to.
+    pythonRepoWithoutTests();
+    const { ctx } = makeCtx({ flags: { method: "manual", traceTimeoutSec: 120 } });
+
+    const result = await runSetupMachine(ctx, traceless());
+
+    const message = plain(result.error?.message ?? "");
+    expect(message).toContain("this service is not instrumented");
+    expect(message).toContain("printed the manual instructions");
+    expect(message).not.toContain(".traceroot/prompts");
+    expect(plain(result.error?.remedy ?? "")).toContain("Apply the steps above");
+  });
+
+  it("does not call a hand-picked repository uninstrumented", async () => {
+    // A repository the user instrumented by hand before running setup is the
+    // reason this route still reaches the trace stage at all. `detect_stack`
+    // saw the initialization, so the hand-over says nothing about whether
+    // there is instrumentation here — and the run waits and reports as usual.
+    pythonRepo();
+    alreadyInstrumented();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+    const result = await runSetupMachine(ctx, traceless());
+
+    expect(ctx.stack?.existingInstrumentation.present).toBe(true);
+    const message = plain(result.error?.message ?? "");
+    expect(message).not.toContain("this service is not instrumented");
+    expect(message).toContain("No trace arrived within");
+    // It really did wait for it, rather than giving up on a verdict it has no
+    // grounds for.
+    expect(plain(err.data)).toContain("Waiting for your first trace");
+  });
+
+  it("still blames the unrun application when an agent did the instrumenting", async () => {
+    // The other diagnosis has to keep working: here the code *was* changed, and
+    // there is no test or health command to exercise it.
+    pythonRepoWithoutTests();
+    initGit();
+    const { ctx } = makeCtx({ flags: { agent: "claude", traceTimeoutSec: 120 } });
+
+    const result = await runSetupMachine(ctx, traceless());
+
+    expect(ctx.instrumentation?.mode).toBe("background");
+    const message = plain(result.error?.message ?? "");
+    expect(message).toContain("nothing has run your application");
+    expect(message).not.toContain("this service is not instrumented");
+  });
+});
+
 describe("JSON mode", () => {
   it("emits typed stage events and a final result with no secrets", async () => {
     pythonRepo();
