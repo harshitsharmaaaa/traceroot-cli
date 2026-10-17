@@ -1,5 +1,5 @@
 import { type Dirent, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { PackageManager } from "../repo/detect.js";
 import type { DetectedService, DetectedStack, StackLanguage } from "./types.js";
 
@@ -569,7 +569,14 @@ export function serviceEntryPath(service: DetectedService): string | null {
  * tried against the repository root and the service directory, because a
  * reported path may be relative to either, and one that turns out to be a
  * directory is read as the source files inside it, because that is how `git
- * status` spells a wholly untracked one.
+ * status` spells a wholly untracked one — which also lets a caller with no
+ * report and no diff to go on name the service's own directory and have it read
+ * under the same bounded budget.
+ *
+ * Every candidate is resolved and required to be inside `root` first. The
+ * reported ones are the agent's own JSON, so an absolute path or a `..` is
+ * whatever the model wrote, and a file outside the repository says nothing
+ * about this service however instrumented it is.
  *
  * Returns the first file found to start TraceRoot, spelled as it was given, or
  * `null` when none of them does.
@@ -594,7 +601,9 @@ export function findTraceRootInitialization(
     candidates.push({ display: file, path: join(dir, file) });
   }
 
-  for (const candidate of expandDirectories(candidates)) {
+  for (const candidate of expandDirectories(
+    candidates.filter((candidate) => withinRoot(root, candidate.path)),
+  )) {
     // The same exclusion detection makes: a compiled bundle mentions
     // everything it ever imported, so reading one reports instrumentation that
     // is not in the source.
@@ -607,6 +616,24 @@ export function findTraceRootInitialization(
     }
   }
   return null;
+}
+
+/**
+ * Whether a resolved path is inside the repository.
+ *
+ * The repository, not the service directory: the candidates are deliberately
+ * resolved against both roots, and a module shared between services is still
+ * this service's instrumentation when its entry point imports it. What is
+ * excluded is everything outside the tree the agent was given —
+ * `/usr/lib/python3/site-packages/traceroot/__init__.py` certifies nothing, and
+ * neither does `../sibling/app.py`.
+ *
+ * `root` itself passes: that is the candidate a root service's own directory
+ * resolves to.
+ */
+function withinRoot(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 /** Extensions worth opening when a whole directory has to be searched. */
@@ -699,7 +726,12 @@ function expandDirectories(
     }
     const display = candidate.display.replace(/\/+$/, "");
     for (const file of sourceFilesUnder(candidate.path)) {
-      expanded.push({ display: `${display}/${file}`, path: join(candidate.path, file) });
+      // `.` is how a root service's own directory arrives, and `./main.py` is
+      // not how anything else in the run spells that file.
+      expanded.push({
+        display: display === "." ? file : `${display}/${file}`,
+        path: join(candidate.path, file),
+      });
     }
   }
   return expanded;

@@ -3055,9 +3055,21 @@ const instrument: StageDefinition = {
       // nothing and the run carries on.
       const entryPoint = serviceEntryPath(service);
       if (ctx.stack?.existingInstrumentation.present !== true && entryPoint !== null) {
+        //
+        // With no report and no diff, both of those lists are empty and the
+        // reading narrows to the entry point alone — which fails a run that put
+        // the call in a module the entry point imports, the case allowed for
+        // just above. Neither input is exotic: `reported` is null for any agent
+        // that does not emit the completion fence, which for Codex is the
+        // expected state rather than the exception, and `changedFiles` is empty
+        // in every repository that is not under git. So when the agent reported
+        // nothing, the service's own directory goes in, and a directory
+        // candidate is read as the same bounded source scan a directory git
+        // reported already gets — not a tree walk.
         const wiredIn = findTraceRootInitialization(ctx.root, service, [
           ...(reported?.filesChanged ?? []),
           ...observedChangedFiles,
+          ...(reported === null ? [service.path] : []),
         ]);
         if (wiredIn === null) {
           throw new PausedSetupError({

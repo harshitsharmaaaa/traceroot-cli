@@ -3173,6 +3173,80 @@ describe("proving the agent did something", () => {
     expect(result.error).toBeNull();
     expect(result.checkpoint.completedStages).toContain("instrument");
   });
+
+  it("accepts that module when the agent reported nothing and there is no git", async () => {
+    // The state the test above does not reach: no completion fence to parse and
+    // no `.git`, so neither of the lists the reading is given has anything in
+    // it. That is the ordinary state of a Codex run in a directory that is not
+    // a repository — and it left the reading looking at `main.py` alone and
+    // failing a run that had instrumented the service one import away.
+    pythonRepo();
+    writeFileSync(join(dir, "tracing.py"), "import traceroot\n\ntraceroot.initialize()\n");
+    writeFileSync(join(dir, "main.py"), "import tracing\n\nprint('hi')\n");
+    const process = fakeRunProcess({
+      // Prose, not a completion block: nothing `parseCompletion` can read.
+      results: { claude: { output: "Added TraceRoot to the service.\n" } },
+      instrument: false,
+    });
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: process.run,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(ctx.stack?.existingInstrumentation.present).toBe(false);
+    expect(result.error).toBeNull();
+    expect(result.checkpoint.completedStages).toContain("instrument");
+  });
+
+  it("says nothing when it could not identify an entry point to read", async () => {
+    // Only ever a positive finding of absence. A service with no recognised
+    // entry file gives the reading nowhere to look, and "I could not check"
+    // must not be reported as "the agent did nothing" — so the stage passes and
+    // the run carries on to the verification that can still answer.
+    writeFileSync(join(dir, "pyproject.toml"), '[project]\ndependencies = ["fastapi","pytest"]\n');
+    const process = fakeRunProcess({ instrument: false });
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: process.run,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude" } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(ctx.stack?.selected?.entryPoint).toBeNull();
+    expect(result.error).toBeNull();
+    expect(result.checkpoint.completedStages).toContain("instrument");
+  });
+
+  it("names the service's own entry point, not a bare filename", async () => {
+    // `apps/api/main.py`, not `main.py`: the message exists for the user to go
+    // and look, and in a monorepo the bare name is ambiguous between every
+    // service that has one.
+    mkdirSync(join(dir, "apps", "api"), { recursive: true });
+    writeFileSync(
+      join(dir, "apps", "api", "pyproject.toml"),
+      '[project]\ndependencies = ["fastapi","pytest"]\n',
+    );
+    writeFileSync(join(dir, "apps", "api", "main.py"), "print('hi')\n");
+    const process = fakeRunProcess({ instrument: false });
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: process.run,
+    });
+    const { ctx } = makeCtx({ flags: { agent: "claude", service: "apps/api" } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error?.code).toBe("AGENT_FAILED");
+    const message = plain(result.error?.message ?? "");
+    expect(message).toContain("apps/api/main.py");
+  });
 });
 
 describe("resume and rerun", () => {
