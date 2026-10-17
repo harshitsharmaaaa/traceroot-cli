@@ -18,6 +18,7 @@ import type { Command } from "commander";
 import { createApiClient } from "../api/client.js";
 import { createTokenProvider } from "../auth/token.js";
 import { configPath } from "../config/manager.js";
+import { MAX_TIMEOUT_MS } from "../context.js";
 import { CliError, ExitCode, defaultWriters } from "../output.js";
 import { runDoctor } from "./doctor.js";
 import { contextFromCommand } from "./shared.js";
@@ -34,7 +35,7 @@ const DEFAULT_TRACE_TIMEOUT_SEC = 120;
  * `--timeout`'s ceiling (Node's timer range) expressed in seconds, so the CLI
  * has one answer to "how long may a duration be".
  */
-const MAX_TRACE_TIMEOUT_SEC = 2_147_483;
+const MAX_TRACE_TIMEOUT_SEC = Math.floor(MAX_TIMEOUT_MS / 1000);
 
 /**
  * Resolves `--trace-timeout`, in seconds.
