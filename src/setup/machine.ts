@@ -778,6 +778,57 @@ function railWriters(ctx: SetupContext): Writers {
 }
 
 /**
+ * Stores a freshly minted session for the host, and returns the entry whether
+ * or not the store took it.
+ *
+ * Both ways a user can sign in end here — the browser approval and the one-shot
+ * code from the web app — with the same entry, the same fields and the same
+ * conditions on the optional two: `auth_host` only when the app and the API are
+ * not the same host, `email` only when the sign-in told us one. Written once so
+ * a later run cannot tell which way this machine signed in.
+ *
+ * Keeping it is what lets the next repository skip the browser entirely, and
+ * this is the only moment it is available — but a store that failed must not
+ * fail a sign-in that otherwise worked. So that is a warning, and the caller
+ * gets the entry back either way, because this run still needs it to mint a
+ * token.
+ */
+function storeSessionCredential(
+  ctx: SetupContext,
+  deps: SetupDeps,
+  session: { host: string; authHost: string; sessionToken: string; email: string | undefined },
+): CredentialEntry {
+  const { host, authHost, email } = session;
+  const entry: CredentialEntry = {
+    session_token: session.sessionToken,
+    created_at: deps.now().toISOString(),
+  };
+  if (authHost !== host) {
+    entry.auth_host = authHost;
+  }
+  if (email !== undefined) {
+    entry.email = email;
+  }
+  try {
+    deps.writeCredential(host, entry);
+  } catch {
+    wizardWarn(ctx, "could not save the TraceRoot sign-in for future runs");
+  }
+  return entry;
+}
+
+/**
+ * How a sign-in line names the account: with the email when one is known, and
+ * without pretending to one when it is not.
+ *
+ * One spelling for the three lines that announce a sign-in, because a user
+ * reading two of them in the same run is comparing accounts.
+ */
+function signedInAs(email: string | undefined): string {
+  return email === undefined ? "Signed in" : `Signed in as ${wizardValue(email)}`;
+}
+
+/**
  * The one line that says a handoff is replacing a different account's sign-in.
  *
  * `writeCredential` *replaces* the host's entry, so redeeming a handoff logs
@@ -798,14 +849,13 @@ function accountSwitchLine(
   if (previous === null) {
     return undefined;
   }
-  const signedIn = email === undefined ? "Signed in" : `Signed in as ${wizardValue(email)}`;
   if (previous.email === undefined || email === undefined) {
-    return `${signedIn}; the sign-in code from the browser replaced the TraceRoot sign-in already saved on this machine.`;
+    return `${signedInAs(email)}; the sign-in code from the browser replaced the TraceRoot sign-in already saved on this machine.`;
   }
   if (previous.email === email) {
     return undefined;
   }
-  return `Signed in as ${wizardValue(previous.email)}; the code from the browser is for ${wizardValue(email)} — switching.`;
+  return `${signedInAs(previous.email)}; the code from the browser is for ${wizardValue(email)} — switching.`;
 }
 
 /**
@@ -851,28 +901,13 @@ async function handoffSignIn(
   // being lost, and after `writeCredential` there is nothing left to compare.
   const switched = accountSwitchLine(deps.readCredential(host), email);
 
-  // Exactly the entry the browser path writes — same fields, same key, same
-  // store — so a later run cannot tell which way this machine signed in.
-  const entry: CredentialEntry = {
-    session_token: sessionToken,
-    created_at: deps.now().toISOString(),
-  };
-  if (authHost !== host) {
-    entry.auth_host = authHost;
-  }
-  if (email !== undefined) {
-    entry.email = email;
-  }
-  try {
-    deps.writeCredential(host, entry);
-  } catch {
-    wizardWarn(ctx, "could not save the TraceRoot sign-in for future runs");
-  }
+  // Exactly the entry the browser path writes, because it is the same writer.
+  const entry = storeSessionCredential(ctx, deps, { host, authHost, sessionToken, email });
 
   wizardNote(
     ctx.writers,
     [
-      switched ?? (email === undefined ? "Signed in." : `Signed in as ${wizardValue(email)}.`),
+      switched ?? `${signedInAs(email)}.`,
       "",
       wizardAside("Used the sign-in code from the browser — no second page needed."),
     ],
@@ -978,36 +1013,19 @@ async function browserSignIn(
     // next call will surface a real problem if there is one.
   }
 
-  // Keep the credential. This is the only moment it is available, and storing
-  // it is what lets the next repository skip this handoff. A failure to store
-  // must not fail a sign-in that otherwise worked — the cost is one more
-  // browser trip later.
-  const entry: CredentialEntry = {
-    session_token: credential.sessionToken,
-    created_at: deps.now().toISOString(),
-  };
-  if (authHost !== host) {
-    entry.auth_host = authHost;
-  }
-  if (email !== undefined) {
-    entry.email = email;
-  }
-  try {
-    deps.writeCredential(host, entry);
-  } catch {
-    wizardWarn(ctx, "could not save the TraceRoot sign-in for future runs");
-  }
+  const entry = storeSessionCredential(ctx, deps, {
+    host,
+    authHost,
+    sessionToken: credential.sessionToken,
+    email,
+  });
 
   // Not `wizardStepLine`: `wizardNote` puts the step glyph on the first row of
   // the block itself, so composing one in as well printed two markers in the
   // gutter — `◇  ◆  Signed in as …`. The glyph belongs to the block, and
   // `wizardStepLine` is for the one caller that has no block to hang it on: the
   // spinner, which needs the settled line in hand before it erases what it drew.
-  wizardNote(
-    ctx.writers,
-    [email === undefined ? "Signed in." : `Signed in as ${wizardValue(email)}.`],
-    { settled: true },
-  );
+  wizardNote(ctx.writers, [`${signedInAs(email)}.`], { settled: true });
 
   const signedIn = await userCredentialSignIn(ctx, deps, host, entry, { announce: false });
   if (!signedIn) {
