@@ -373,6 +373,18 @@ export const runProcess: RunProcess = (options) =>
     let exited = false;
     let chunks = "";
     const decoders: StringDecoder[] = [];
+    const secrets = options.secrets ?? [];
+
+    /** Keeps decoded text for `output`, and streams it to `onData` as it arrives. */
+    const append = (text: string): void => {
+      if (text === "") {
+        return;
+      }
+      chunks += text;
+      // Redacted per chunk as well as in `output`: a caller renders these
+      // straight to the terminal, so an unscrubbed chunk is a visible leak.
+      options.onData?.(redact(text, secrets));
+    };
 
     // Only captured runs are detached. `inherit` hands the terminal to an
     // interactive agent, and a new session would take that child out of the
@@ -440,14 +452,7 @@ export const runProcess: RunProcess = (options) =>
       // process that ends mid-character would otherwise leave the two differing
       // by exactly the flushed text.
       for (const decoder of decoders) {
-        const tail = decoder.end();
-        if (tail === "") {
-          continue;
-        }
-        chunks += tail;
-        if (options.onData !== undefined) {
-          options.onData(redact(tail, options.secrets ?? []));
-        }
+        append(decoder.end());
       }
       clearTimeout(timer);
       clearTimeout(drainTimer);
@@ -467,7 +472,7 @@ export const runProcess: RunProcess = (options) =>
       options.signal?.removeEventListener("abort", onAbort);
       resolve({
         exitCode,
-        output: redact(chunks, options.secrets ?? []),
+        output: redact(chunks, secrets),
         durationMs: Date.now() - started,
         timedOut,
         spawnFailed,
@@ -567,21 +572,11 @@ export const runProcess: RunProcess = (options) =>
       // the worktree does not have. Separate decoders because stdout and stderr
       // arrive interleaved and share this callback — one decoder would splice the
       // two streams' partial characters together.
-      const absorb = (decoder: StringDecoder) => (buf: Buffer) => {
-        const text = decoder.write(buf);
-        if (text === "") {
-          return;
-        }
-        chunks += text;
-        // Redacted per chunk as well as in `output`: a caller renders these
-        // straight to the terminal, so an unscrubbed chunk is a visible leak.
-        if (options.onData !== undefined) {
-          options.onData(redact(text, options.secrets ?? []));
-        }
-      };
-      decoders.push(new StringDecoder("utf8"), new StringDecoder("utf8"));
-      child.stdout?.on("data", absorb(decoders[0] as StringDecoder));
-      child.stderr?.on("data", absorb(decoders[1] as StringDecoder));
+      for (const stream of [child.stdout, child.stderr]) {
+        const decoder = new StringDecoder("utf8");
+        decoders.push(decoder);
+        stream?.on("data", (buf: Buffer) => append(decoder.write(buf)));
+      }
     }
 
     if (options.stdin !== undefined) {
