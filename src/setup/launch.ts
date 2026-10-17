@@ -254,14 +254,15 @@ export function buildInvocation(input: BuildInvocationInput): AgentInvocation {
       //
       //   The whole allow list — the `Bash(prog:*)` rules and the `Edit(**)` and
       //   `Read(**)` rules alike. Codex has no per-tool allow list of any kind:
-      //   `codex exec --help` offers no `--allowed-tools`, and the one control
-      //   over what the agent may do is `-s, --sandbox`, whose values are
-      //   `read-only`, `workspace-write` and `danger-full-access`. Claude needs
-      //   the rules because its permissions are per tool and its mode covers
-      //   only some of them; `--sandbox workspace-write` below grants reads,
-      //   writes and execution across the workspace in one, so there is nothing
-      //   left for a rule to add. (Checked against codex-cli 0.163.0 — the only
-      //   part of this case that has now been run against the binary.)
+      //   `codex exec --help` offers no `--allowed-tools`, and what the agent may
+      //   touch is set by `-s, --sandbox`, whose values are `read-only`,
+      //   `workspace-write` and `danger-full-access`. Claude needs the rules
+      //   because its permissions are per tool and its mode covers only some of
+      //   them; `--sandbox workspace-write` below grants reads, writes and
+      //   execution across the workspace in one, so there is nothing left for a
+      //   rule to add. Whether the agent stops to ask before touching any of it
+      //   is a separate control, and the `approval_policy` override above is
+      //   where this launch settles that one.
       //
       //   `readableDirs` — Claude's `--add-dir` exists because Claude Code
       //   scopes file *reads* to the working directory and the skill installs
