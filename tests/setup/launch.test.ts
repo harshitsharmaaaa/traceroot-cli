@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildAgentEnv, buildInvocation, launchAgent } from "../../src/setup/launch.js";
 import { makeSecret } from "../../src/setup/secret.js";
-import { buildSetupTask, taskInterpreters } from "../../src/setup/task.js";
+import { buildSetupTask, taskPrograms } from "../../src/setup/task.js";
 import type { DetectedService } from "../../src/setup/types.js";
 import { fakeRunProcess } from "./helpers.js";
 
@@ -300,22 +300,35 @@ describe("letting the agent edit the service it was pointed at", () => {
 describe("the interpreter the task recommends and the one the agent may run", () => {
   const ROOT = "/repo";
   const SERVICE_PATH = "api";
+  const SDK = { package: "traceroot", version: "1.2.3", source: "registry" } as const;
 
-  function task(pythonInterpreter: string | null): string {
+  /** A Python service on pip unless a case says otherwise. */
+  function service(overrides: Partial<DetectedService> = {}): DetectedService {
+    return {
+      path: SERVICE_PATH,
+      language: "python",
+      framework: null,
+      entryPoint: "main.py",
+      packageManager: "pip",
+      testCommand: null,
+      evidence: [],
+      ...overrides,
+    } as unknown as DetectedService;
+  }
+
+  function task(
+    pythonInterpreter: string | null,
+    overrides: Partial<DetectedService> = {},
+  ): string {
+    const detected = service(overrides);
     return buildSetupTask({
-      service: {
-        path: SERVICE_PATH,
-        language: "python",
-        framework: null,
-        entryPoint: "main.py",
-        packageManager: "pip",
-        testCommand: null,
-        evidence: [],
-      } as unknown as DetectedService,
+      service: detected,
       root: ROOT,
-      sdk: { package: "traceroot", version: "1.2.3", source: "registry" },
+      sdk: SDK,
       skillPath: ".claude/skills/traceroot-instrument-repo",
-      verifyCommand: null,
+      // From the service, as the instrument stage takes it, so a fixture's
+      // check reaches the task and the rules by the same route.
+      verifyCommand: detected.testCommand,
       interactive: false,
       existingInstrumentation: [],
       pythonInterpreter,
@@ -323,12 +336,24 @@ describe("the interpreter the task recommends and the one the agent may run", ()
     });
   }
 
-  function rules(pythonInterpreter: string | null): string[] {
+  function rules(
+    pythonInterpreter: string | null,
+    overrides: Partial<DetectedService> = {},
+  ): string[] {
+    const detected = service(overrides);
     return buildInvocation({
       agentId: "claude",
       task: "t",
       interactive: false,
-      allowedPrograms: taskInterpreters(pythonInterpreter, ROOT, SERVICE_PATH),
+      // The call the instrument stage makes, so a program the task names is
+      // asserted against the rules the launched agent is actually given.
+      allowedPrograms: taskPrograms({
+        service: detected,
+        root: ROOT,
+        sdk: SDK,
+        pythonInterpreter,
+        verifyCommand: detected.testCommand,
+      }),
     }).args;
   }
 
@@ -340,6 +365,20 @@ describe("the interpreter the task recommends and the one the agent may run", ()
    */
   function programInRunCommand(text: string): string {
     const command = /run it with: `([^`]+)`/.exec(text)?.[1];
+    expect(command).toBeDefined();
+    return (command as string).split(" ")[0];
+  }
+
+  /** The same, for the one command step 2 of the task hands over in full. */
+  function programInInstallCommand(text: string): string {
+    const command = /### 2\. Install the SDK[\s\S]*?```bash\n([^\n]+)\n```/.exec(text)?.[1];
+    expect(command).toBeDefined();
+    return (command as string).split(" ")[0];
+  }
+
+  /** And for the check the task tells the agent to run once, when one exists. */
+  function programInCheckCommand(text: string): string {
+    const command = /1\. Run `([^`]+)` once and confirm it passes\./.exec(text)?.[1];
     expect(command).toBeDefined();
     return (command as string).split(" ")[0];
   }
@@ -370,6 +409,75 @@ describe("the interpreter the task recommends and the one the agent may run", ()
     const named = /run the application with `([^`]+)` throughout/.exec(task(null))?.[1];
     expect(named).toBeDefined();
     expect(rules(null)).toContain(`Bash(${named}:*)`);
+  });
+
+  it("allows the program the run command names for a TypeScript entry point", () => {
+    // `npx tsx <entry>`, which is the run line for 8 of the 13 entry points in
+    // `NODE_ENTRY_POINTS`. Unallowed, a headless run has nobody to ask, so the
+    // call is refused: the service is instrumented, never once executed, and
+    // the trace wait ends up reporting that the instrumented path never ran —
+    // true, and the symptom rather than the denial.
+    const ts: Partial<DetectedService> = {
+      language: "typescript",
+      entryPoint: "src/index.ts",
+      packageManager: "npm",
+    };
+    const named = programInRunCommand(task(null, ts));
+    expect(named).toBe("npx");
+    expect(rules(null, ts)).toContain("Bash(npx:*)");
+  });
+
+  it("allows the package manager the install step names", () => {
+    // Step 2 is the first command of the run and it is handed over in full,
+    // for whichever manager was detected. Two that no rule used to cover.
+    const poetry: Partial<DetectedService> = { packageManager: "poetry" };
+    expect(programInInstallCommand(task(null, poetry))).toBe("poetry");
+    expect(rules(null, poetry)).toContain("Bash(poetry:*)");
+
+    const bun: Partial<DetectedService> = {
+      language: "typescript",
+      entryPoint: "index.js",
+      packageManager: "bun",
+    };
+    expect(programInInstallCommand(task(null, bun))).toBe("bun");
+    expect(rules(null, bun)).toContain("Bash(bun:*)");
+  });
+
+  it("allows the check the task tells the agent to run once", () => {
+    // Step 5 is handed over in full, like step 2, and `pytest` is the bare
+    // string `detectStack` produces for a Python project on pip or Poetry. A
+    // refused check costs the agent the single attempt the task is written to
+    // buy it, and its recovery — `./.venv/bin/python -m pytest` — only works
+    // where a virtualenv was found.
+    const pip: Partial<DetectedService> = { testCommand: "pytest" };
+    expect(programInCheckCommand(task(null, pip))).toBe("pytest");
+    expect(rules(null, pip)).toContain("Bash(pytest:*)");
+
+    // `uv` runs it through its own environment, which was already allowed —
+    // asserted so the two spellings cannot be mistaken for one case.
+    const uv: Partial<DetectedService> = { packageManager: "uv", testCommand: "uv run pytest" };
+    expect(programInCheckCommand(task(null, uv))).toBe("uv");
+    expect(rules(null, uv)).toContain("Bash(uv:*)");
+  });
+
+  it("allows no check when none was detected", () => {
+    // There the task tells the agent to find the project's own check, which is
+    // a command nobody here can name — so there is nothing to allow, and an
+    // empty rule would be a rule matching everything.
+    const named = rules(null);
+    expect(named).not.toContain("Bash(:*)");
+    expect(named).not.toContain("Bash(pytest:*)");
+  });
+
+  it("names no program the task did not, and never widens to every command", () => {
+    // Scoped per run: a Python service's rules must not carry the Node
+    // manager's program, and the whole point of an allow list is lost if a
+    // bare `Bash(*)` ever reaches the argv.
+    const python = rules("/repo/api/.venv/bin/python");
+    expect(python).not.toContain("Bash(bun:*)");
+    expect(python).not.toContain("Bash(npx:*)");
+    expect(python).not.toContain("Bash(*)");
+    expect(python).not.toContain("Bash");
   });
 });
 
