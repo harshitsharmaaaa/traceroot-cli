@@ -1240,7 +1240,15 @@ describe("the production block that closes a run", () => {
     // The block names the variable and the file. The value goes into the env
     // file and the child's environment and nowhere a terminal, a CI log or a
     // scrollback buffer can keep it.
-    const { out, err } = await run({ canPrompt: true });
+    const { result, out, err } = await run({ canPrompt: true });
+
+    // Both assertions below are negative, and this is the only test guarding
+    // the key against the terminal — so the run has to be pinned as having
+    // succeeded and having printed the block. Without these two, a run that
+    // died at `precheck`, or a block that stopped printing altogether, would
+    // satisfy the test by printing nothing at all.
+    expect(result.ok).toBe(true);
+    expect(flat(err.data)).toContain("Add the TRACEROOT_API_KEY and TRACEROOT_HOST_URL variables");
 
     expect(err.data).not.toContain(KEY);
     expect(out.data).not.toContain(KEY);

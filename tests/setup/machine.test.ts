@@ -2050,9 +2050,11 @@ describe("where the application's key ended up", () => {
     const deps = depsFor(authFrom("config"));
     deps.runProcess = fakeRunProcess({
       gitStatus: ["", " M main.py"],
-      // `git status` is answered above; `ls-files` is the only other git call,
-      // so this reports the file as tracked.
-      results: { git: { output: ".env\n" } },
+      // Answered per subcommand, not per program: `.env` on stdout means
+      // "tracked" to `ls-files` and "ignored" to `check-ignore`, so a single
+      // canned answer tells this stage two contradictory things and only
+      // happens to exercise the tracked branch because that one returns first.
+      git: (args) => (args.includes("ls-files") ? { output: ".env\n" } : {}),
     }).run;
     const { ctx } = makeCtx({ flags: { agent: "claude" } });
 
@@ -2064,6 +2066,28 @@ describe("where the application's key ended up", () => {
     expect(readFileSync(join(dir, ".env"), "utf8")).toBe("# committed by mistake\n");
     expect(ctx.refusedCredentialEnvFile).toBe(join(dir, ".env"));
     expect(applicationKeyLocation(ctx, deps)).toEqual({ kind: "refused", path: ".env" });
+  });
+
+  it("names the service's own .env for an ambient key, not the repository root's", async () => {
+    // The ambient branch joins `ctx.cwd`, not `ctx.root`, because the file
+    // `resolveAuth` auto-discovers is the one beside where the command ran —
+    // and in a monorepo that is the service, not the repository. Every other
+    // case here runs from the root, where the two are the same directory, so
+    // this is the only input that can tell the right join from the wrong one.
+    // Called directly rather than after a pipeline: the fact under test is the
+    // path arithmetic, and the two context fields it reads first are unset.
+    const service = join(dir, "apps", "api");
+    mkdirSync(service, { recursive: true });
+    writeFileSync(join(service, ".env"), `TRACEROOT_API_KEY=${KEY}\n`);
+    const deps = depsFor(authFrom("auto-env-file"));
+    const { ctx } = makeCtx({ cwd: service, flags: { agent: "claude", service: "apps/api" } });
+
+    expect(ctx.credentialEnvFile).toBeUndefined();
+    expect(ctx.refusedCredentialEnvFile).toBeUndefined();
+    expect(applicationKeyLocation(ctx, deps)).toEqual({
+      kind: "file",
+      path: join("apps", "api", ".env"),
+    });
   });
 });
 
