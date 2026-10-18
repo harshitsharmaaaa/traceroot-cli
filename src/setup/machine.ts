@@ -143,6 +143,11 @@ const SKILL_NAME = "traceroot-instrument-repo";
  */
 export interface SetupDeps {
   resolvedAuth: ResolvedAuth;
+  /**
+   * The warning naming the repository-local hosts a `--handoff` run left out of
+   * `resolvedAuth`, said once when authentication starts. See `setupContext`.
+   */
+  hostsSetAside?: string;
   env: NodeJS.ProcessEnv;
   now: () => Date;
   runProcess: RunProcess;
@@ -479,6 +484,12 @@ const authenticate: StageDefinition = {
   async run(ctx, deps) {
     const host = deps.resolvedAuth.hostUrl.value ?? DEFAULT_HOST;
     const existing = apiKeyFrom(deps.resolvedAuth);
+
+    // Said before anything is sent, because `host` above is already the
+    // deployment the code will go to.
+    if (deps.hostsSetAside !== undefined) {
+      wizardWarn(ctx, deps.hostsSetAside);
+    }
 
     // Browser-first onboarding's one-shot code. It is redeemed at most once per
     // run, from whichever of the two rungs below is reached first.
@@ -1959,10 +1970,23 @@ const configureRepository: StageDefinition = {
     // mentioned again.
     const keys = applicationEnvKeys(session.host);
     const updates: Record<string, string> = { [KEY_ENV]: credential.key.reveal() };
-    if (keys.includes(HOST_ENV)) {
+    // A host line the file already holds for another deployment is replaced
+    // even on the hosted product, where the key alone is otherwise the whole
+    // set: the application reads that line, so the new key and its traces would
+    // go to a deployment the key does not belong to. The usual source is a
+    // repository `.env` whose host a `--handoff` run ignored.
+    const fileHost = envFileHost(envPath)?.trim().replace(/\/+$/, "");
+    const replacesHost = fileHost !== undefined && fileHost !== "" && fileHost !== session.host;
+    if (keys.includes(HOST_ENV) || replacesHost) {
       updates[HOST_ENV] = session.host;
     }
     const result = upsertEnvFile(envPath, updates);
+    if (replacesHost && result.written.includes(HOST_ENV)) {
+      wizardWarn(
+        ctx,
+        `replaced ${HOST_ENV} in ${envEntry} (${fileHost}) with ${session.host}, the deployment this run's key belongs to`,
+      );
+    }
     // `created`, because undoing a write and undoing a file are different
     // things and only the writer knows which this was.
     wroteEnvKeys.set(ctx, { path: envPath, keys: result.written, created: result.created });
@@ -2067,6 +2091,15 @@ async function warnIfNotIgnored(ctx: SetupContext, deps: SetupDeps, entry: strin
 function envFileKey(path: string): string | undefined {
   try {
     return loadOptionalEnvFileFromDisk(path)[KEY_ENV];
+  } catch {
+    return undefined;
+  }
+}
+
+/** The host a dotenv file points the application at, read the way {@link envFileKey} reads its key. */
+function envFileHost(path: string): string | undefined {
+  try {
+    return loadOptionalEnvFileFromDisk(path)[HOST_ENV];
   } catch {
     return undefined;
   }

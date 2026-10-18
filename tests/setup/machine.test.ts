@@ -18,6 +18,7 @@ import { BackendUnavailableError, SetupApiError } from "../../src/api/setup.js";
 import type { CredentialEntry } from "../../src/auth/credentials.js";
 import { openBrowserForPlatform } from "../../src/auth/deviceFlow.js";
 import { DEFAULT_HOST } from "../../src/commands/constants.js";
+import { setupContext } from "../../src/commands/setup/run.js";
 import type { ResolvedAuth } from "../../src/config/resolve.js";
 import { CliError, ExitCode } from "../../src/output.js";
 import { serviceArtifactDir } from "../../src/setup/artifacts.js";
@@ -1083,7 +1084,9 @@ describe("the handoff code from browser-first onboarding", () => {
     pythonRepo();
     const launched = fakeRunProcess({ gitStatus: ["", " M main.py"] });
     const written: CredentialEntry[] = [];
+    const writtenTo: string[] = [];
     const minted: string[] = [];
+    const mintedAt: string[] = [];
     const redeemed: Array<{ authHost: string; code: string }> = [];
     const keysUsed: string[] = [];
     let deviceFlows = 0;
@@ -1105,7 +1108,10 @@ describe("the handoff code from browser-first onboarding", () => {
       client,
       runProcess: launched.run,
       storedCredential: options.stored ?? null,
-      onWriteCredential: (_host, entry) => written.push(entry),
+      onWriteCredential: (host, entry) => {
+        writtenTo.push(host);
+        written.push(entry);
+      },
       runDeviceFlow: async () => {
         deviceFlows += 1;
         return { sessionToken: options.deviceToken ?? "device-session-token-value" };
@@ -1124,6 +1130,7 @@ describe("the handoff code from browser-first onboarding", () => {
     // exactly what "the handoff won" means, so record it.
     deps.createTokenProvider = (opts) => {
       minted.push(opts.sessionToken);
+      mintedAt.push(opts.authHost);
       return { getAccessToken: async () => "access-jwt-value", invalidate: () => undefined };
     };
     // Which API key the run actually authenticates with. `whoami` alone cannot
@@ -1142,7 +1149,9 @@ describe("the handoff code from browser-first onboarding", () => {
       ...harness,
       deps,
       written,
+      writtenTo,
       minted,
+      mintedAt,
       redeemed,
       keysUsed,
       launched: launched.runs,
@@ -1465,6 +1474,62 @@ describe("the handoff code from browser-first onboarding", () => {
       expect(JSON.stringify(launch.env)).not.toContain(CODE);
       expect(launch.args.join(" ")).not.toContain(CODE);
       expect(launch.stdin ?? "").not.toContain(CODE);
+    }
+  });
+
+  it("says once which repository hosts it set aside, before anything is sent", async () => {
+    const line =
+      "ignored TRACEROOT_HOST_URL in ./.env for --handoff; the hand-back command names its deployment with --host";
+    const occurrences = (text: string) => text.split(line).length - 1;
+
+    // A refused code climbs every rung — the code, then the device flow — and
+    // the line still appears once, ahead of the first of them.
+    const refused = handoffRun({ redeem: async () => ({ kind: "rejected" }) });
+    refused.deps.hostsSetAside = line;
+    expect((await runSetupMachine(refused.ctx, refused.deps)).ok).toBe(true);
+    const text = said(refused.err.data);
+    expect(occurrences(text)).toBe(1);
+    expect(text.indexOf(line)).toBeLessThan(text.indexOf("is no longer valid"));
+    expect(refused.deviceFlows()).toBe(1);
+
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    const quiet = handoffRun();
+    expect((await runSetupMachine(quiet.ctx, quiet.deps)).ok).toBe(true);
+    expect(said(quiet.err.data)).not.toContain("for --handoff");
+  });
+
+  it("stores the session under the host the code was redeemed at", async () => {
+    // Across the seam: the hosts `setupContext` settles are the ones the
+    // redemption, the stored entry and every later mint use.
+    const REPO = "https://repo-chosen.example.test";
+    const SELF = "https://traceroot.self.example.test";
+    const hermetic = {
+      env: {},
+      readConfig: () => null,
+      loadEnvFile: () => ({}),
+      readCredential: () => null,
+      configIsLocal: true,
+    };
+    const cases = [
+      { flags: {}, autoEnv: { TRACEROOT_HOST_URL: REPO }, host: DEFAULT_HOST },
+      { flags: { host: SELF }, autoEnv: { TRACEROOT_AUTH_URL: REPO }, host: SELF },
+    ];
+    for (const { flags, autoEnv, host } of cases) {
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      const { context } = setupContext(
+        { ...flags, handoff: CODE },
+        { ...hermetic, loadAutoEnvFile: () => autoEnv },
+      );
+      const run = handoffRun({ auth: context.auth });
+      expect((await runSetupMachine(run.ctx, run.deps)).ok, host).toBe(true);
+
+      expect(run.redeemed, host).toEqual([{ authHost: host, code: CODE }]);
+      expect(run.writtenTo, host).toEqual([host]);
+      // No `auth_host`: the session belongs wholly to that one deployment.
+      expect(run.written[0]?.auth_host, host).toBeUndefined();
+      expect(new Set(run.mintedAt), host).toEqual(new Set([host]));
     }
   });
 });
@@ -4753,6 +4818,71 @@ describe("where a run leaves its files", () => {
     expect(ctx.session?.host).toBe(DEFAULT_HOST);
     expect(written).toContain("TRACEROOT_API_KEY=");
     expect(written).not.toContain("TRACEROOT_HOST_URL");
+  });
+
+  describe("a host line the file already holds", () => {
+    const REPO = "https://repo-chosen.example.test";
+    const NOTICE = "replaced TRACEROOT_HOST_URL in .env";
+
+    function onHostedProduct(): SetupDeps {
+      const deps = mintingDeps();
+      deps.resolvedAuth = {
+        ...deps.resolvedAuth,
+        hostUrl: { value: DEFAULT_HOST, source: "config" },
+      };
+      return deps;
+    }
+
+    it("is replaced by the run's host, even the hosted product's, and the run says so once", async () => {
+      // Left alone, the application reads it and sends the new key — and its
+      // traces — to a deployment the key does not belong to. A `--handoff` run
+      // that ignored a repository `.env`'s host is how one gets here.
+      pythonRepo();
+      initGit();
+      writeFileSync(join(dir, ".env"), `TRACEROOT_HOST_URL=${REPO}\n`);
+      const { ctx, err } = makeCtx({ flags: { agent: "claude", project: "demo" } });
+      await runSetupMachine(ctx, onHostedProduct());
+
+      expect(readFileSync(join(dir, ".env"), "utf8")).toBe(
+        `TRACEROOT_HOST_URL=${DEFAULT_HOST}\n\nTRACEROOT_API_KEY=tr-minted-secret-value-42\n`,
+      );
+      const line = `${NOTICE} (${REPO}) with ${DEFAULT_HOST}, the deployment this run's key belongs to`;
+      expect(plain(err.data).split(line)).toHaveLength(2);
+    });
+
+    it("is left untouched when it already names the run's host", async () => {
+      for (const existing of [
+        `TRACEROOT_HOST_URL=${DEFAULT_HOST}`,
+        `TRACEROOT_HOST_URL=${DEFAULT_HOST}/`,
+      ]) {
+        rmSync(dir, { recursive: true, force: true });
+        mkdirSync(dir, { recursive: true });
+        pythonRepo();
+        initGit();
+        writeFileSync(join(dir, ".env"), `${existing}\n`);
+        const { ctx, err } = makeCtx({ flags: { agent: "claude", project: "demo" } });
+        await runSetupMachine(ctx, onHostedProduct());
+
+        expect(readFileSync(join(dir, ".env"), "utf8"), existing).toBe(
+          `${existing}\n\nTRACEROOT_API_KEY=tr-minted-secret-value-42\n`,
+        );
+        expect(plain(err.data), existing).not.toContain(NOTICE);
+      }
+    });
+
+    it("leaves a fresh repository's first run as it was", async () => {
+      pythonRepo();
+      initGit();
+      const { ctx, err } = makeCtx({ flags: { agent: "claude", project: "demo" } });
+      await runSetupMachine(ctx, onHostedProduct());
+
+      const written = readFileSync(join(dir, ".env"), "utf8");
+      expect(written.startsWith("# Created by `traceroot setup`.")).toBe(true);
+      expect(written.endsWith("\n\nTRACEROOT_API_KEY=tr-minted-secret-value-42\n")).toBe(true);
+      expect(written).not.toContain("TRACEROOT_HOST_URL");
+      expect(plain(err.data)).toContain("Created .env with TRACEROOT_API_KEY (0600).");
+      expect(plain(err.data)).not.toContain(NOTICE);
+    });
   });
 
   it("heads the credential file it creates with what it is", async () => {
