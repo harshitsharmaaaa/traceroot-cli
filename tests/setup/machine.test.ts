@@ -4587,6 +4587,52 @@ describe("how to instrument", () => {
     expect(how?.options).toEqual(["task-file", "manual"]);
   });
 
+  it("says why it does not offer an installed agent it cannot launch", async () => {
+    // `npm i -g` installs Claude Code on Windows as `claude.cmd`, which setup
+    // refuses to launch. The run option is left out either way; without a line
+    // saying why, it just went missing from a menu the user expected it in.
+    pythonRepo();
+    initGit();
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    const shim = join(dir, "bin", "claude.cmd");
+    writeFileSync(shim, "", { mode: 0o755 });
+    // Detection reads the platform from the process, so Windows is faked for
+    // as long as it takes to reach the question, and no longer.
+    const realPlatform = Object.getOwnPropertyDescriptor(
+      globalThis.process,
+      "platform",
+    ) as PropertyDescriptor;
+    const restorePlatform = () =>
+      Object.defineProperty(globalThis.process, "platform", realPlatform);
+    const { deps, asked } = recordingSelect(
+      makeDeps({
+        auth: authWithKey(),
+        client: fakeApiClient({ traces: [traceRow()] }),
+        runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
+        env: { PATH: join(dir, "bin"), PATHEXT: ".EXE;.CMD" },
+        answers: ["task-file"],
+      }),
+    );
+    const select = deps.select;
+    deps.select = async (input) => {
+      restorePlatform();
+      return select(input);
+    };
+    const { ctx, err } = makeCtx({ canPrompt: true, flags: { agent: undefined } });
+    Object.defineProperty(globalThis.process, "platform", { ...realPlatform, value: "win32" });
+    try {
+      await runSetupMachine(ctx, deps);
+    } finally {
+      restorePlatform();
+    }
+
+    const how = asked.find((q) => q.message.includes("How should TraceRoot be added"));
+    expect(how?.options).toEqual(["task-file", "manual"]);
+    expect(plain(err.data)).toContain(
+      `warning: Claude Code is on PATH as a batch shim, ${shim}, which setup cannot launch on Windows. Put the native claude.exe ahead of it on PATH for setup to run it.`,
+    );
+  });
+
   it("still launches exactly what --agent names", async () => {
     // The flag is an instruction, and it bypasses the question entirely.
     pythonRepo();

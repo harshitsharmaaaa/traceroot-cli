@@ -2682,6 +2682,13 @@ async function chooseInstrumentation(
   }
 
   const runnable = detected.filter((agent) => agent.runnable);
+  // Left out of the options below, so it has to say why or the run option
+  // just goes missing.
+  for (const agent of detected) {
+    if (agent.unlaunchable !== undefined) {
+      wizardWarn(ctx, agent.unlaunchable);
+    }
+  }
   const answer = await deps.select({
     stage: "select_agent",
     message: "How should TraceRoot be added to this service?",
