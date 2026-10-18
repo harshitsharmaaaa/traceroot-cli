@@ -556,7 +556,7 @@ describe("authentication", () => {
         key: "tr-browser-minted-key-1234",
       }),
     });
-    const saved: Array<[string, string, string | null]> = [];
+    const saved: Array<[string, string]> = [];
     const deps = makeDeps({
       auth: authEmpty(),
       setupApi,
@@ -664,12 +664,12 @@ describe("authentication", () => {
     expect(result.ok).toBe(true);
     expect(created).toHaveLength(1);
     // Named after the repository.
-    expect(created[0][0]).toBe(basename(ctx.root));
+    expect(created[0]?.[0]).toBe(basename(ctx.root));
     // The device flow hands back identity only — no workspace comes attached
     // the way the old fat handoff payload carried one — so the workspace is
     // resolved here instead, from `listWorkspaces`. A sole workspace is used
     // without asking.
-    expect(created[0][1]).toBe("w_1");
+    expect(created[0]?.[1]).toBe("w_1");
     expect(ctx.project?.projectId).toBe("p_new");
     expect(ctx.credential?.origin).toBe("minted");
     expect(written).toEqual([
@@ -718,7 +718,7 @@ describe("authentication", () => {
     const result = await runSetupMachine(ctx, deps);
 
     expect(result.ok).toBe(true);
-    expect(created[0][1]).toBe("w_2");
+    expect(created[0]?.[1]).toBe("w_2");
   });
 
   it("does not offer a workspace the user can only view", async () => {
@@ -759,7 +759,7 @@ describe("authentication", () => {
     const result = await runSetupMachine(ctx, deps);
 
     expect(result.ok).toBe(true);
-    expect(created[0][1]).toBe("w_2");
+    expect(created[0]?.[1]).toBe("w_2");
   });
 
   it("says so when the account has no workspace the user can create in", async () => {
@@ -972,7 +972,7 @@ describe("authentication", () => {
       ...deps,
       readCredential: (host) => {
         asked.push(host);
-        return undefined;
+        return null;
       },
     };
     const { ctx } = makeCtx({ canPrompt: false });
@@ -1523,7 +1523,11 @@ describe("the handoff code from browser-first onboarding", () => {
       readCredential: () => null,
       configIsLocal: true,
     };
-    const cases = [
+    const cases: Array<{
+      flags: { host?: string };
+      autoEnv: Record<string, string>;
+      host: string;
+    }> = [
       { flags: {}, autoEnv: { TRACEROOT_HOST_URL: REPO }, host: DEFAULT_HOST },
       { flags: { host: SELF }, autoEnv: { TRACEROOT_AUTH_URL: REPO }, host: SELF },
     ];
@@ -3924,7 +3928,9 @@ describe("a suite that was already failing", () => {
     const stage = events.find(
       (e) => e.event === "stage" && e.stage === "verify_application" && e.status !== "start",
     );
-    expect(stage?.event === "stage" ? stage.data : undefined).toMatchObject({
+    expect(
+      stage?.event === "stage" && stage.status !== "start" ? stage.data : undefined,
+    ).toMatchObject({
       outcome: "inconclusive",
       passed: false,
       baseline_exit_code: 1,
@@ -5448,7 +5454,9 @@ describe("what a failed run takes back", () => {
     // checkpoint is written at the mint rather than at the end of the stage,
     // and this reads it from disk from inside the run, four stages later.
     pythonRepo();
-    let midRun: ReturnType<typeof readCheckpoint> = null;
+    // Widened by hand: it is assigned in a callback, which the narrowing of
+    // `= null` cannot see, so every read below would otherwise be `never`.
+    let midRun = null as ReturnType<typeof readCheckpoint>;
     const { deps } = signInThenFail({
       atFailure: () => {
         midRun = readCheckpoint(dir);

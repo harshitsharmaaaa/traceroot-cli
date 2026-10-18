@@ -8,6 +8,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { type Command, CommanderError } from "commander";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_TIMEOUT_MS } from "../../src/api/client.js";
 import { buildProgram } from "../../src/cli.js";
 import { runDoctor } from "../../src/commands/doctor.js";
 import {
@@ -83,7 +84,7 @@ afterEach(() => {
 });
 
 function ctxWith(json = false): Context {
-  return { auth: authWithKey(), json };
+  return { auth: authWithKey(), json, timeoutMs: DEFAULT_TIMEOUT_MS };
 }
 
 describe("canPrompt", () => {
@@ -1076,7 +1077,7 @@ describe("doctor reports setup state", () => {
     const out = new StringSink();
     const err = new StringSink();
     const report = await runDoctor({
-      ctx: { auth: auth(), json: false },
+      ctx: { auth: auth(), json: false, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       env: {},
       configPath: join(dir, ".traceroot", "config.json"),
@@ -1103,7 +1104,7 @@ describe("doctor reports setup state", () => {
     const out = new StringSink();
     const err = new StringSink();
     const report = await runDoctor({
-      ctx: { auth: auth(), json: false },
+      ctx: { auth: auth(), json: false, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       env: {},
       configPath: join(dir, ".traceroot", "config.json"),
@@ -1136,7 +1137,7 @@ describe("doctor reports setup state", () => {
 
     const out = new StringSink();
     const report = await runDoctor({
-      ctx: { auth: auth(), json: false },
+      ctx: { auth: auth(), json: false, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       env: {},
       configPath: join(dir, ".traceroot", "config.json"),
@@ -1154,7 +1155,7 @@ describe("doctor reports setup state", () => {
 
   it("says setup has not run rather than inventing a failure", async () => {
     const report = await runDoctor({
-      ctx: { auth: auth(), json: false },
+      ctx: { auth: auth(), json: false, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       env: {},
       configPath: join(dir, ".traceroot", "config.json"),
@@ -1171,7 +1172,7 @@ describe("doctor reports setup state", () => {
   it("omits the Setup section entirely for a plain doctor run with no checkpoint", async () => {
     mkdirSync(join(dir, ".traceroot"), { recursive: true });
     const report = await runDoctor({
-      ctx: { auth: auth(), json: false },
+      ctx: { auth: auth(), json: false, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       env: {},
       configPath: join(dir, ".traceroot", "config.json"),
@@ -1185,7 +1186,7 @@ describe("doctor reports setup state", () => {
   function doctorFor(checkpoint: ReturnType<typeof newCheckpoint>) {
     writeCheckpoint(dir, checkpoint);
     return runDoctor({
-      ctx: { auth: auth(), json: false },
+      ctx: { auth: auth(), json: false, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       env: {},
       configPath: join(dir, ".traceroot", "config.json"),
@@ -1320,7 +1321,7 @@ describe("a failed run under --json", () => {
   }> {
     const { writers, out, err } = makeWriters();
     const result = await runSetup({
-      ctx: { auth: authEmpty(), json },
+      ctx: { auth: authEmpty(), json, timeoutMs: DEFAULT_TIMEOUT_MS },
       cwd: dir,
       flags: defaultFlags({ agent: "claude" }),
       writers,
@@ -1355,7 +1356,7 @@ describe("a failed run under --json", () => {
 
     const envelopes = errorEnvelopes(out, err);
     expect(envelopes).toHaveLength(1);
-    expect((envelopes[0].error as { code: string }).code).toBe("NOT_AUTHENTICATED");
+    expect((envelopes[0]?.error as { code: string }).code).toBe("NOT_AUTHENTICATED");
     // The exit status still travels, so a script's `$?` is unchanged.
     expect(failure).toEqual({ kind: "exit", code: result.error?.exitCode });
   });
@@ -1590,7 +1591,7 @@ describe("the question asked about a previous run", () => {
     expect(question.options.map((o) => o.label)).toEqual(["Leave it as it is", "Run setup again"]);
     // Keeping the finished run is the default: starting over mints a second API
     // key and re-runs an agent over code it has already edited.
-    expect(question.options[0].value).toBe("resume");
+    expect(question.options[0]?.value).toBe("resume");
   });
 
   it("asks the finished question for real, on a checkpoint a completed run wrote", async () => {
