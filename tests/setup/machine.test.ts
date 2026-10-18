@@ -3544,6 +3544,114 @@ describe("the agent a hand-over targets", () => {
     expect(skillInstalled(dir, ".claude", "skills")).toBe(true);
   });
 
+  /**
+   * `$CODEX_HOME` outside the repository, where a real `~/.codex` is. The
+   * suite's own pin sits inside the fixture, which makes Codex's copy of the
+   * skill a write into the repository and hides the case these tests are for.
+   */
+  function withCodexHomeOutsideRepository(): string {
+    const home = mkdtempSync(join(tmpdir(), "tr-codex-home-"));
+    process.env.CODEX_HOME = home;
+    return home;
+  }
+
+  it("says where the skill went when Codex keeps it outside the repository", async () => {
+    // Codex is detected from the home directory, never from this repository,
+    // so a fresh repository on a machine with a leftover `~/.codex` hands over
+    // to Codex, and the skill is written into the home directory. Picking
+    // Codex is right; doing that without a word is not, because `git diff`
+    // will never show the write.
+    pythonRepo();
+    const home = withCodexHomeOutsideRepository();
+    try {
+      const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+      await runSetupMachine(ctx, handoverDeps());
+
+      expect(ctx.agent?.id).toBe("codex");
+      expect(skillInstalled(home, "skills")).toBe(true);
+      // The whole destination, on one line. Matched on its tail, because
+      // whether the home directory prints as `~` depends on where the temp
+      // directory happens to sit.
+      const line = plain(err.data)
+        .split("\n")
+        .find((l) => l.includes("Installed the TraceRoot skill"));
+      expect(line).toContain("Installed the TraceRoot skill for Codex in ");
+      expect(line).toContain(
+        `${join(basename(home), "skills", "traceroot-instrument-repo")}, outside this repository.`,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names that place in the report's list of touched files", async () => {
+    pythonRepo();
+    const home = withCodexHomeOutsideRepository();
+    try {
+      // The task was run in Codex and its trace arrived, so the run reaches
+      // the report — which is written only by a run that finishes.
+      const deps = makeDeps({
+        auth: authWithKey(),
+        client: fakeApiClient({ traces: [traceRow()] }),
+        runProcess: fakeRunProcess().run,
+      });
+      const { ctx } = makeCtx({ flags: { instrument: false } });
+
+      const result = await runSetupMachine(ctx, deps);
+
+      expect(result.error).toBeNull();
+      expect(result.ok).toBe(true);
+      const report = readFileSync(join(dir, ".traceroot", "setup-report.md"), "utf8");
+      const row = report.split("\n").find((l) => l.includes("The instrumentation skill"));
+      expect(row).toContain(`${basename(home)}/skills/traceroot-instrument-repo/\``);
+      expect(row).toMatch(/ \| The instrumentation skill, outside this repository\. \|$/);
+      // Not the Claude Code directory, which this run never created.
+      expect(report).not.toContain(".claude/skills/");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("names the generic agent's own skill directory in the report", async () => {
+    // With no agent set up, the skill goes in the tool-neutral `.agents/`, and
+    // the report has to say so rather than name Claude Code's directory.
+    pythonRepo();
+    const deps = makeDeps({
+      auth: authWithKey(),
+      client: fakeApiClient({ traces: [traceRow()] }),
+      runProcess: fakeRunProcess().run,
+    });
+    const { ctx } = makeCtx({ flags: { instrument: false } });
+
+    const result = await runSetupMachine(ctx, deps);
+
+    expect(result.error).toBeNull();
+    expect(ctx.agent?.id).toBe("generic");
+    expect(skillInstalled(dir, ".agents", "skills")).toBe(true);
+    const report = readFileSync(join(dir, ".traceroot", "setup-report.md"), "utf8");
+    expect(report).toContain(
+      "| `.agents/skills/traceroot-instrument-repo/` | The instrumentation skill. |",
+    );
+    expect(report).not.toContain(".claude/skills/");
+  });
+
+  it("says nothing about the skill when it lands inside the repository", async () => {
+    // Claude Code's copy goes in `.claude/`, which `git diff` already shows, so
+    // the install stays the silent bookkeeping it always was.
+    pythonRepo();
+    withClaudeConfigured();
+    const { ctx, err } = makeCtx({ flags: { instrument: false, traceTimeoutSec: 1 } });
+
+    await runSetupMachine(ctx, handoverDeps());
+
+    expect(ctx.agent?.id).toBe("claude");
+    expect(skillInstalled(dir, ".claude", "skills")).toBe(true);
+    const said = plain(err.data);
+    expect(said).not.toContain("Installed the TraceRoot skill");
+    expect(said).not.toContain("outside this repository");
+  });
+
   it("asks which one when both are set up, and honours the answer", async () => {
     pythonRepo();
     withClaudeConfigured();

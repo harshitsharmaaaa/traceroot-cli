@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
-import { displaySkillPath, requireAgent } from "../agents/index.js";
+import { displaySkillPath, isInsideDirectory, requireAgent } from "../agents/index.js";
 import type { AgentAdapter } from "../agents/types.js";
 import { type ApiClient, type ApiClientOptions, createApiClient } from "../api/client.js";
 import {
@@ -2320,6 +2320,16 @@ const installAgentContext: StageDefinition = {
         force: true,
         dryRun: false,
       });
+      // Except when the copy lands outside the repository. Codex reads its
+      // skills from the user's home, so a run started here writes there — a
+      // change `git diff` will never show, and not one to leave the user to
+      // find by accident.
+      if (!isInsideDirectory(ctx.root, targetDir)) {
+        wizardProgress(
+          ctx,
+          `Installed the TraceRoot skill for ${agent.displayName} in ${displaySkillPath(ctx.root, targetDir)}, outside this repository.`,
+        );
+      }
     } catch (err) {
       // The task prompt is self-contained, so a failed skill install degrades
       // the run rather than ending it.
