@@ -1246,18 +1246,38 @@ describe("a repository that already reports to a project", () => {
      */
     const refused = new Map<string, string>();
     const offline = new Set<string>();
+    /** What `whoami` reports as each key's scope; nothing, like an older server, unless set. */
+    const scopes = new Map<string, "ingest" | "admin">();
+    /** Key names already used in a project, as `<project id> <name>`. */
+    const taken = new Set<string>();
+    /** Opt-in, so the tests above see the server they were written against. */
+    const settings = { reportScopes: false, enforceNames: false };
+    /** Every name a mint asked for, granted or not. */
+    const asked: string[] = [];
     let minted = 0;
     return {
       owner,
       unreachable,
       refused,
       offline,
+      scopes,
+      taken,
+      settings,
+      asked,
       mint(projectId: string, name: string, scope: "ingest" | "admin" | undefined) {
+        asked.push(name);
+        if (settings.enforceNames && taken.has(`${projectId} ${name}`)) {
+          throw new SetupApiError(`An API key named '${name}' already exists in this project`, 409);
+        }
+        taken.add(`${projectId} ${name}`);
         minted += 1;
         const key = `tr-${scope}-${projectId}-${minted}`;
         const project = PROJECTS.find((p) => p.project_id === projectId);
         if (project !== undefined) {
           owner.set(key, project);
+        }
+        if (settings.reportScopes && scope !== undefined) {
+          scopes.set(key, scope);
         }
         return {
           id: `ak_${minted}`,
@@ -1289,13 +1309,20 @@ describe("a repository that already reports to a project", () => {
       answers?: string[];
       canPrompt?: boolean;
       flags?: Partial<SetupFlags>;
+      /** A credential that outranks the saved sign-in: a key session. */
+      auth?: ResolvedAuth;
+      /** The CLI's config as an earlier run left it. */
+      config?: { api_key: string; host_url: string };
+      resumeFrom?: ReturnType<typeof newCheckpoint>;
+      /** Called where the run fails, after the env file was written. */
+      failAtInstrument?: () => void;
     },
   ) {
     const asked: Parameters<SetupDeps["select"]>[0][] = [];
     const calls: string[] = [];
     const configured: string[] = [];
     const base = makeDeps({
-      auth: authEmpty(),
+      auth: options.auth ?? authEmpty(),
       setupApi: fakeSetupApi({
         listProjects: async () => {
           calls.push("listProjects");
@@ -1311,9 +1338,29 @@ describe("a repository that already reports to a project", () => {
       answers: options.answers ?? [],
       storedCredential: { session_token: "saved-session-token" },
       onWriteConfig: (config) => configured.push(config.api_key),
+      config: options.config,
     });
     const deps: SetupDeps = {
       ...base,
+      // The key-authenticated mint answers for the project of the key calling it,
+      // as the server's does.
+      createSetupApi: (opts) => ({
+        ...base.createSetupApi(opts),
+        listApiKeys: async () => [],
+        createApiKey: async (input) => {
+          const projectId = world.owner.get(opts.apiKey ?? "")?.project_id ?? "";
+          calls.push(`mint by key ${input.scope} ${projectId}`);
+          return world.mint(projectId, input.name, input.scope);
+        },
+      }),
+      ...(options.failAtInstrument === undefined
+        ? {}
+        : {
+            resolveSdk: async () => {
+              options.failAtInstrument?.();
+              throw new Error("the registry refused the request");
+            },
+          }),
       // `whoami` answers for the key it is asked about, as the real one does:
       // with the project that key was minted into.
       createClient: (opts) => {
@@ -1338,7 +1385,8 @@ describe("a repository that already reports to a project", () => {
             if (project === undefined) {
               throw new SetupApiError("Invalid API key", 401);
             }
-            return whoami({ ...project });
+            const scope = world.scopes.get(key);
+            return whoami({ ...project, ...(scope === undefined ? {} : { key_scope: scope }) });
           },
           traces: [traceRow()],
         });
@@ -1351,6 +1399,7 @@ describe("a repository that already reports to a project", () => {
     const harness = makeCtx({
       canPrompt: options.canPrompt ?? true,
       flags: { agent: "claude", ...options.flags },
+      resumeFrom: options.resumeFrom,
     });
     return { ...harness, deps, asked, calls, configured };
   }
@@ -1701,6 +1750,387 @@ describe("a repository that already reports to a project", () => {
     );
     expect(each.ctx.session?.via).toBe("user-credential");
   });
+
+  // ── what a rerun already has ──────────────────────────────────────────────
+
+  const HOST = "https://api.example.test";
+  const ENV_WITH_KEY = `TRACEROOT_API_KEY=tr-app-key\nTRACEROOT_HOST_URL=${HOST}\n`;
+  const mints = (calls: string[]) => calls.filter((call) => call.startsWith("mint"));
+
+  it("mints neither key on a rerun that already has both", async () => {
+    // Each run minted a fresh pair, so every rerun left the last pair live and
+    // recorded nowhere.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const world = server(["tr-app-key", TEST_GLOBEX], ["tr-cli-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      config: { api_key: "tr-cli-key", host_url: HOST },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual([]);
+    expect(each.configured).toEqual(["tr-cli-key"]);
+    expect(each.ctx.session?.userKey.reveal()).toBe("tr-cli-key");
+    expect(each.ctx.credential?.origin).toBe("reused");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(ENV_WITH_KEY);
+    expect(plain(each.err.data)).toContain("Reusing the existing project API key.");
+  });
+
+  it("mints only the CLI's key when the env file still has the application's", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const world = server(["tr-app-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [ALPHA, TEST_ACME, TEST_GLOBEX] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual(["mint admin p_t2"]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(ENV_WITH_KEY);
+  });
+
+  it("mints only the application's key when the config still has the CLI's", async () => {
+    pythonRepo();
+    const world = server(["tr-cli-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [TEST_GLOBEX],
+      config: { api_key: "tr-cli-key", host_url: HOST },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual(["mint ingest p_t2"]);
+    expect(each.configured).toEqual(["tr-cli-key"]);
+    expect(world.reportsTo()).toBe("p_t2");
+  });
+
+  it("does not keep an application key that can manage keys", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-admin-in-env\n");
+    const world = server(["tr-admin-in-env", TEST_GLOBEX]);
+    world.settings.reportScopes = true;
+    world.scopes.set("tr-admin-in-env", "admin");
+    const each = setupRun(world, { listed: [TEST_GLOBEX] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual(["mint admin p_t2", "mint ingest p_t2"]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).not.toContain("tr-admin-in-env");
+    expect(world.reportsTo()).toBe("p_t2");
+  });
+
+  it("never sends the CLI's key to a host it was not written for", async () => {
+    pythonRepo();
+    const world = server(["tr-cli-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [TEST_GLOBEX],
+      config: { api_key: "tr-cli-key", host_url: "https://elsewhere.example.test" },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(each.calls).not.toContain("whoami tr-cli-key");
+    expect(mints(each.calls)).toEqual(["mint admin p_t2", "mint ingest p_t2"]);
+  });
+
+  it("mints a CLI key for the chosen project when the config's belongs to another", async () => {
+    // Kept anyway, the config would go on holding the other project's key while
+    // the repository reported to this one.
+    pythonRepo();
+    const world = server(["tr-acme-cli-key", TEST_ACME]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      answers: ["p_t2"],
+      config: { api_key: "tr-acme-cli-key", host_url: HOST },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    // Asked about, so it is the project that ruled it out rather than the host.
+    expect(each.calls).toContain("whoami tr-acme-cli-key");
+    expect(mints(each.calls)).toEqual(["mint admin p_t2", "mint ingest p_t2"]);
+    expect(each.configured).toEqual(["tr-admin-p_t2-1"]);
+    expect(each.ctx.session?.userKey.reveal()).toBe("tr-admin-p_t2-1");
+  });
+
+  it("resumes on the keys the paused run left, and stops calling them orphans", async () => {
+    // `--resume`, and "Leave it as it is" on a finished run, are reruns too:
+    // authentication is never restored from the checkpoint.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const paused = newCheckpoint(new Date("2026-07-26T12:00:00.000Z"));
+    paused.completedStages.push(
+      "precheck",
+      "authenticate",
+      "select_context",
+      "acquire_project_key",
+      "configure_repository",
+      "detect_stack",
+      "select_agent",
+      "install_agent_context",
+      "instrument",
+      "verify_application",
+    );
+    paused.lastError = { stage: "verify_trace", code: "TRACE_TIMEOUT", message: "no trace" };
+    paused.mintedKeys = [
+      { id: "ak_cli", name: "traceroot-cli-repo", hint: "tr-hint-cli" },
+      { id: "ak_app", name: "traceroot-repo", hint: "tr-hint-app" },
+    ];
+    writeCheckpoint(dir, paused);
+    const world = server(["tr-app-key", TEST_GLOBEX], ["tr-cli-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [TEST_GLOBEX],
+      flags: { resume: true },
+      config: { api_key: "tr-cli-key", host_url: HOST },
+      resumeFrom: readCheckpoint(dir) ?? undefined,
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual([]);
+    // They are the keys in service now.
+    expect(each.ctx.checkpoint.mintedKeys).toEqual([]);
+  });
+
+  it("finds a free name on the third run in a day", async () => {
+    // The base name, then the date: one more name a day, so the third run had
+    // nowhere left to go and failed.
+    pythonRepo();
+    const world = server();
+    world.settings.enforceNames = true;
+    for (const name of [`traceroot-cli-${basename(dir)}`, `traceroot-${basename(dir)}`]) {
+      world.taken.add(`p_a ${name}`);
+      world.taken.add(`p_a ${name}-2026-07-26`);
+    }
+    const each = setupRun(world, { listed: [ALPHA] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    const cli = `traceroot-cli-${basename(dir)}`;
+    const app = `traceroot-${basename(dir)}`;
+    expect(world.asked).toEqual([
+      cli,
+      `${cli}-2026-07-26`,
+      `${cli}-2026-07-26-2`,
+      app,
+      `${app}-2026-07-26`,
+      `${app}-2026-07-26-2`,
+    ]);
+  });
+
+  it("stops looking for a free name after ten dated ones", async () => {
+    pythonRepo();
+    const world = server();
+    world.settings.enforceNames = true;
+    const base = `traceroot-cli-${basename(dir)}`;
+    world.taken.add(`p_a ${base}`);
+    world.taken.add(`p_a ${base}-2026-07-26`);
+    for (let n = 2; n <= 10; n += 1) {
+      world.taken.add(`p_a ${base}-2026-07-26-${n}`);
+    }
+    const each = setupRun(world, { listed: [ALPHA] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.message).toContain("already exists in this project");
+    // The base name, the date, then nine counted ones.
+    expect(world.asked).toHaveLength(11);
+  });
+
+  // ── a key session: the CLI's config, `--api-key` or an exported key ─────────
+
+  const configKey = (key: string): ResolvedAuth => authWithKey(key);
+  const flagKey = (key: string): ResolvedAuth => ({
+    ...authWithKey(key),
+    credential: { kind: "api-key", value: key, source: "flag" },
+  });
+
+  it("keeps the application's key when the CLI's own key signs in, as after `traceroot logout`", async () => {
+    // `logout` leaves the config's admin key behind, and the next run signed in
+    // with it and wrote it over the application's send-only key.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const world = server(["tr-cli-key", TEST_GLOBEX], ["tr-app-key", TEST_GLOBEX]);
+    world.scopes.set("tr-cli-key", "admin");
+    const each = setupRun(world, { listed: [], auth: configKey("tr-cli-key"), canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(each.ctx.credential?.origin).toBe("reused");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(ENV_WITH_KEY);
+    expect(mints(each.calls)).toEqual([]);
+  });
+
+  it("asks before a key session moves the repository, and stays on No", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const world = server(["tr-acme-key", TEST_ACME], ["tr-app-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [], auth: configKey("tr-acme-key"), answers: [""] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("CANCELLED");
+    const question = each.asked.find((input) => input.message.includes("Switch it to"));
+    expect(plain(question?.message ?? "")).toContain("'test' in Globex (w_2)");
+    expect(plain(question?.message ?? "")).toContain("'test' in Acme (w_1)");
+    expect(question?.initialValue).toBe("no");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(ENV_WITH_KEY);
+  });
+
+  it("stops a run nobody watches before a key it did not name moves the repository", async () => {
+    // A key in the CLI's config, or exported from a shell profile, was not
+    // chosen by this run.
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const world = server(["tr-acme-key", TEST_ACME], ["tr-app-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [], auth: configKey("tr-acme-key"), canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("UNSAFE_OVERWRITE");
+    expect(result.error?.message).toContain("'test' in Globex (w_2)");
+    expect(result.error?.remedy).toContain("traceroot setup --api-key <key>");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(ENV_WITH_KEY);
+  });
+
+  it("moves it when --api-key named the key in this run, and says so", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), ENV_WITH_KEY);
+    const world = server(["tr-acme-key", TEST_ACME], ["tr-app-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [], auth: flagKey("tr-acme-key"), canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(world.reportsTo()).toBe("p_t1");
+    expect(plain(each.err.data)).toContain(
+      "this repository sent its traces to 'test' in Globex (w_2); from now on it sends them to 'test' in Acme (w_1), as --api-key asked",
+    );
+  });
+
+  it("gives the application a send-only key of its own rather than an admin key", async () => {
+    pythonRepo();
+    const world = server(["tr-cli-key", TEST_GLOBEX]);
+    world.settings.reportScopes = true;
+    world.scopes.set("tr-cli-key", "admin");
+    const each = setupRun(world, { listed: [], auth: configKey("tr-cli-key"), canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual(["mint by key ingest p_t2"]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).not.toContain("tr-cli-key");
+    expect(world.reportsTo()).toBe("p_t2");
+    expect(each.ctx.session?.userKey.reveal()).toBe("tr-cli-key");
+  });
+
+  it("still writes an admin key this run was handed with --api-key, as the user's choice", async () => {
+    // The key the user names for this run is the single credential they chose;
+    // only the CLI's own config key is kept out of the application's env file.
+    pythonRepo();
+    const world = server(["tr-handed-admin", TEST_GLOBEX]);
+    world.scopes.set("tr-handed-admin", "admin");
+    const each = setupRun(world, {
+      listed: [],
+      auth: flagKey("tr-handed-admin"),
+      canPrompt: false,
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual([]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).toContain("TRACEROOT_API_KEY=tr-handed-admin");
+  });
+
+  for (const scope of [undefined, "ingest"] as const) {
+    it(`still writes a key of ${scope ?? "unreported"} scope as the application's, as before`, async () => {
+      // The single-credential shape a key from `traceroot login` or `--api-key`
+      // has always had.
+      pythonRepo();
+      const world = server(["tr-own-key", TEST_GLOBEX]);
+      if (scope !== undefined) {
+        world.scopes.set("tr-own-key", scope);
+      }
+      const each = setupRun(world, { listed: [], auth: flagKey("tr-own-key"), canPrompt: false });
+
+      const result = await runSetupMachine(each.ctx, each.deps);
+
+      expect(result.error).toBeNull();
+      expect(mints(each.calls)).toEqual([]);
+      expect(each.ctx.credential?.origin).toBe("existing-config");
+      expect(readFileSync(join(dir, ".env"), "utf8")).toContain("TRACEROOT_API_KEY=tr-own-key");
+    });
+  }
+
+  it("stops rather than write a key session's key over one it could not check", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-unverified-key\n");
+    const world = server(["tr-acme-key", TEST_ACME]);
+    world.offline.add("tr-unverified-key");
+    const each = setupRun(world, { listed: [], auth: configKey("tr-acme-key"), canPrompt: false });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("UNSAFE_OVERWRITE");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe("TRACEROOT_API_KEY=tr-unverified-key\n");
+  });
+
+  // ── what a rollback leaves ─────────────────────────────────────────────────
+
+  it("puts back the key a cancelled rerun replaced, exactly as it was written", async () => {
+    // Undoing the write used to mean deleting the line, which left an
+    // application that worked before setup with no key at all.
+    pythonRepo();
+    const before = `# app\nexport TRACEROOT_API_KEY=tr-app-key\nTRACEROOT_HOST_URL=${HOST}\nDEBUG=1\n`;
+    writeFileSync(join(dir, ".env"), before);
+    const world = server(["tr-app-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      answers: ["p_t1", "yes", "abort"],
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("CANCELLED");
+    expect(readFileSync(join(dir, ".env"), "utf8")).toBe(before);
+    expect(plain(each.err.data)).toContain("Restored the previous TRACEROOT_API_KEY in .env.");
+  });
+
+  it("puts it back key by key when something else changed the file after the write", async () => {
+    pythonRepo();
+    writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-app-key\nDEBUG=1\n");
+    const world = server(["tr-app-key", TEST_GLOBEX]);
+    const each = setupRun(world, {
+      listed: [ALPHA, TEST_ACME, TEST_GLOBEX],
+      answers: ["p_t1", "yes"],
+      failAtInstrument: () => {
+        writeFileSync(join(dir, ".env"), `${readFileSync(join(dir, ".env"), "utf8")}AGENT=1\n`);
+      },
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("UNEXPECTED");
+    const after = readFileSync(join(dir, ".env"), "utf8");
+    expect(after).toContain("TRACEROOT_API_KEY=tr-app-key");
+    expect(after).not.toContain("TRACEROOT_HOST_URL");
+    expect(after).toContain("DEBUG=1");
+    expect(after).toContain("AGENT=1");
+    const said = plain(each.err.data);
+    expect(said).toContain("Restored the previous TRACEROOT_API_KEY in .env.");
+    expect(said).toContain("Removed TRACEROOT_HOST_URL from .env.");
+  });
 });
 
 describe("project credential", () => {
@@ -2001,8 +2431,20 @@ describe("the credential the instrumented application will read", () => {
     initGit();
     writeFileSync(join(dir, ".env"), "TRACEROOT_API_KEY=tr-some-other-key\n");
     const { ctx, events } = makeCtx({ flags: { agent: "claude" } });
+    const deps = configuredKeyRun(authFrom("auto-env-file"));
+    // Stale in the server's own words. A key it still accepted for this project
+    // would be kept rather than replaced.
+    const answer = deps.createClient;
+    deps.createClient = (opts) =>
+      opts.auth.kind === "api-key" && opts.auth.key === "tr-some-other-key"
+        ? fakeApiClient({
+            whoamiResult: async () => {
+              throw new CliError("Invalid API key", ExitCode.auth);
+            },
+          })
+        : answer(opts);
 
-    const result = await runSetupMachine(ctx, configuredKeyRun(authFrom("auto-env-file")));
+    const result = await runSetupMachine(ctx, deps);
 
     expect(result.error).toBeNull();
     expect(statusOf(events, "configure_repository")).toBe("ok");

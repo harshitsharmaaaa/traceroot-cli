@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
 import { displaySkillPath, requireAgent } from "../agents/index.js";
@@ -31,8 +32,8 @@ import {
   decodeJwtClaims,
 } from "../auth/token.js";
 import { DEFAULT_HOST } from "../commands/constants.js";
-import { loadOptionalEnvFileFromDisk } from "../config/envFile.js";
-import { writeConfig as realWriteConfig } from "../config/manager.js";
+import { loadOptionalEnvFileFromDisk, parseEnvFile } from "../config/envFile.js";
+import { readConfig as realReadConfig, writeConfig as realWriteConfig } from "../config/manager.js";
 import { type ResolvedAuth, normalizeApiKey } from "../config/resolve.js";
 import { ExitCode, type Writers } from "../output.js";
 import type { Prompt } from "../prompt.js";
@@ -153,6 +154,11 @@ export interface SetupDeps {
   promptHidden: (question: string) => Promise<string>;
   resolveSdk: (pkg: SdkPackage) => Promise<ResolvedSdk>;
   writeConfig: (config: { api_key: string; host_url: string }) => void;
+  /**
+   * The CLI's own config as an earlier run left it, or null when there is none:
+   * where a rerun finds the CLI key it already has rather than minting another.
+   */
+  readConfig: () => { api_key?: string; host_url?: string } | null;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Interactive single choice; injected so stages stay testable without a TTY. */
   select: SelectFn;
@@ -232,6 +238,10 @@ export function defaultSetupDeps(resolvedAuth: ResolvedAuth): SetupDeps {
     },
     resolveSdk: (pkg) => resolveSdkVersion(pkg),
     writeConfig: realWriteConfig,
+    readConfig: () => {
+      const read = realReadConfig();
+      return read.ok ? read.config : null;
+    },
     sleep,
     select: interactiveSelect,
     makeTempDir: () => mkdtempSync(join(tmpdir(), "traceroot-setup-")),
@@ -940,16 +950,35 @@ async function userCredentialSignIn(
   // send telemetry and nothing else. One key doing both jobs meant every
   // deployment of the instrumented application carried a credential that could
   // enumerate and revoke the project's keys.
-  const cli = await mintProjectKey(ctx, deps, api, chosen.project.projectId, "admin");
-  const app = await mintProjectKey(ctx, deps, api, chosen.project.projectId, "ingest");
+  //
+  // A rerun mints neither key it already has. Minting a fresh pair every time
+  // left each earlier pair live and recorded nowhere, and the third run in a day
+  // failed outright on a name the first two had taken. The CLI's is the key an
+  // earlier run wrote to its config; the application's is the one in the env
+  // file read above, kept unless it belongs elsewhere or can manage keys. A first
+  // run has neither, so it mints both, as it always has.
+  const projectId = chosen.project.projectId;
+  const configured = await configuredCliKey(deps, host, projectId);
+  const cli = configured ?? (await mintProjectKey(ctx, deps, api, projectId, "admin"));
+  const kept =
+    existing !== null && existing.who.project_id === projectId && !isAdminScoped(existing.who)
+      ? existing
+      : null;
+  const application =
+    kept === null
+      ? mintedCredential(await mintProjectKey(ctx, deps, api, projectId, "ingest"), projectId)
+      : reusedCredential(ctx, kept, projectId);
   const key = makeSecret(cli.key);
 
   // Verify before persisting, exactly as the browser path does. `whoami` is
   // also where `ui_base_url` comes from — the deployment's own answer for where
-  // trace links live, which nothing else on this path knows.
-  const who = await deps
-    .createClient({ host, auth: { kind: "api-key", key: key.reveal() }, timeoutMs: 15_000 })
-    .whoami();
+  // trace links live, which nothing else on this path knows. The config's key
+  // was verified when it was read.
+  const who =
+    configured?.who ??
+    (await deps
+      .createClient({ host, auth: { kind: "api-key", key: key.reveal() }, timeoutMs: 15_000 })
+      .whoami());
 
   deps.writeConfig({ api_key: cli.key, host_url: host });
 
@@ -969,36 +998,81 @@ async function userCredentialSignIn(
   };
   // The application's key, not the CLI's. Everything downstream that writes a
   // credential into the repository or hands one to a child process reads this.
-  const appKey = makeSecret(app.key);
-  ctx.credential = {
-    key: appKey,
-    keyId: app.id,
-    keyName: app.name,
-    projectId: chosen.project.projectId,
-    expiresAt: app.expires_at,
-    origin: "minted",
-  };
+  ctx.credential = application;
   ctx.checkpoint.host = host;
   ctx.checkpoint.uiBaseUrl = who.ui_base_url;
   ctx.checkpoint.workspaceId = chosen.project.workspaceId;
   // The key the report and the closing notice are about is the one the
   // application carries, so the recorded id and hint are the application's.
-  ctx.checkpoint.projectKeyId = app.id;
-  ctx.checkpoint.projectKeyHint = appKey.hint;
+  if (application.keyId !== null) {
+    ctx.checkpoint.projectKeyId = application.keyId;
+  }
+  ctx.checkpoint.projectKeyHint = application.key.hint;
   recordProject(ctx);
 
   wizardProgress(ctx, `Project ${chosen.project.projectName}.`);
+  if (kept !== null) {
+    wizardProgress(ctx, "Reusing the existing project API key.");
+  }
   return true;
+}
+
+/**
+ * The CLI key an earlier run wrote to the CLI's config, while it still works
+ * for this project on this host.
+ *
+ * Null for anything else — no config, no key in it, a config written for
+ * another host, a key the server refuses or cannot be asked about, a key for
+ * another project — and the caller mints, as a first run does. The host is
+ * compared before anything is sent, so the key never goes to a deployment it
+ * was not written for.
+ */
+async function configuredCliKey(
+  deps: SetupDeps,
+  host: string,
+  projectId: string,
+): Promise<{ key: string; who: Awaited<ReturnType<ApiClient["whoami"]>> } | null> {
+  let config: ReturnType<SetupDeps["readConfig"]>;
+  try {
+    config = deps.readConfig();
+  } catch {
+    return null;
+  }
+  const key = normalizeApiKey(config?.api_key ?? "");
+  const writtenFor = (config?.host_url ?? DEFAULT_HOST).trim().replace(/\/+$/, "");
+  if (key === "" || writtenFor !== host) {
+    return null;
+  }
+  try {
+    const who = await deps
+      .createClient({ host, auth: { kind: "api-key", key }, timeoutMs: 15_000 })
+      .whoami();
+    return who.project_id === projectId ? { key, who } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `whoami` reports the key as admin-scoped.
+ *
+ * Read structurally because `key_scope` is newer than the vendored schema. A
+ * deployment that predates scopes sends nothing, which reads as no, so nothing
+ * changes there.
+ */
+function isAdminScoped(who: Awaited<ReturnType<ApiClient["whoami"]>>): boolean {
+  return (who as { key_scope?: unknown }).key_scope === "admin";
 }
 
 /**
  * Mints one of this repository's two keys, naming it after the repository.
  *
- * A name collision means setup already ran here. The old key's secret is
- * unrecoverable by design, so there is nothing to reuse — the only options are
- * to mint a distinguishable sibling or to fail a rerun outright, and failing a
- * rerun would be absurd. The suffix is the run date, which keeps the key list
- * readable rather than filling it with opaque ids.
+ * A name collision means setup already ran here and this run cannot read that
+ * key's secret back: the caller reuses any key it can still read, and the
+ * server never shows a secret twice. So the only options are to mint a
+ * distinguishable sibling or to fail a rerun outright, and failing a rerun
+ * would be absurd. The suffix is the run date, then a count after it, which
+ * keeps the key list readable rather than filling it with opaque ids.
  *
  * The `admin` request can be refused on authorization rather than on
  * authentication: minting a key that can manage a project's other keys is
@@ -1036,7 +1110,18 @@ async function mintProjectKey(
       if (!isNameConflict(err)) {
         throw err;
       }
-      return await mint(`${base}-${deps.now().toISOString().slice(0, 10)}`, withScope);
+    }
+    // The run date, then a count after it. The date alone gave one more name a
+    // day, so a third run in the same day had nowhere left to go.
+    const dated = `${base}-${deps.now().toISOString().slice(0, 10)}`;
+    for (let n = 1; ; n += 1) {
+      try {
+        return await mint(n === 1 ? dated : `${dated}-${n}`, withScope);
+      } catch (err) {
+        if (!isNameConflict(err) || n === MAX_DATED_KEY_NAMES) {
+          throw err;
+        }
+      }
     }
   };
 
@@ -1056,6 +1141,14 @@ async function mintProjectKey(
     return await attempt("ingest");
   }
 }
+
+/**
+ * How many dated names one mint tries, the bare date included. A bound, so a
+ * server that answers 409 to everything ends the run instead of looping; ten is
+ * already more same-day reruns than a repository whose earlier keys are reused
+ * should ever see.
+ */
+const MAX_DATED_KEY_NAMES = 10;
 
 /** A 409 from the key-minting route: the name is taken. */
 function isNameConflict(err: unknown): boolean {
@@ -1389,12 +1482,14 @@ async function chooseProject(
  * the picker and `configure_repository` replacing the env file's key with one
  * for whichever project was picked. That is how three runs in one repository
  * sent its traces to three projects. Asked here, between the choice and the
- * first mint, so a refusal leaves nothing behind.
+ * first mint, so a refusal leaves nothing behind. A key session asks it from
+ * `acquire_project_key`, before its key is written; see {@link settleSessionKey}.
  *
  * A person is asked, with both projects named by workspace, because two
- * projects can share a name. A run nobody is watching stops instead, unless
- * `--project` named the destination: that is the user choosing it in this run,
- * so the run goes ahead and says so.
+ * projects can share a name. A run nobody is watching stops instead, unless a
+ * flag named the destination: that is the user choosing it in this run, so the
+ * run goes ahead and says so. Which flag can do that, and what to rerun, depend
+ * on how the run signed in; see {@link SwitchRoute}.
  */
 async function confirmProjectSwitch(
   ctx: SetupContext,
@@ -1403,6 +1498,14 @@ async function confirmProjectSwitch(
   chosen: { projectId: string; projectName: string; workspaceId: string },
   projects: readonly ProjectSummary[],
   stage: SetupStage,
+  route: SwitchRoute = {
+    namedBy: ctx.flags.project === undefined ? undefined : "--project",
+    move: [
+      "To move this repository to that project, name it:",
+      `  traceroot setup --project ${chosen.projectId}`,
+    ],
+    keep: "Rerun `traceroot setup` and accept the project it opens on.",
+  },
 ): Promise<void> {
   if (existing === null || existing.who.project_id === chosen.projectId) {
     return;
@@ -1442,14 +1545,14 @@ async function confirmProjectSwitch(
       stage,
       code: "CANCELLED",
       message: `Setup cancelled — this repository still sends its traces to ${from}.`,
-      remedy: "Rerun `traceroot setup` and accept the project it opens on.",
+      remedy: route.keep,
     });
   }
 
-  if (ctx.flags.project !== undefined) {
+  if (route.namedBy !== undefined) {
     wizardWarn(
       ctx,
-      `this repository sent its traces to ${from}; from now on it sends them to ${to}, as --project asked`,
+      `this repository sent its traces to ${from}; from now on it sends them to ${to}, as ${route.namedBy} asked`,
     );
     return;
   }
@@ -1458,12 +1561,28 @@ async function confirmProjectSwitch(
     stage,
     code: "UNSAFE_OVERWRITE",
     message: `${existing.envEntry} already contains a working TraceRoot key for ${from}, but setup selected ${to}.`,
-    remedy: [
-      "To move this repository to that project, name it:",
-      `  traceroot setup --project ${chosen.projectId}`,
-      `or remove ${KEY_ENV} from ${existing.envEntry} if it is stale.`,
-    ].join("\n"),
+    remedy: [...route.move, `or remove ${KEY_ENV} from ${existing.envEntry} if it is stale.`].join(
+      "\n",
+    ),
   });
+}
+
+/**
+ * How a run can choose a repository's destination, which differs by how it
+ * signed in.
+ *
+ * A signed-in user picks a project, so `--project` names it. A key session has
+ * no picker: the key decides, so the only flag that names the destination is
+ * `--api-key`. A key exported from a shell profile, or left in the CLI's config
+ * by an earlier run, was not chosen by this run and does not count.
+ */
+interface SwitchRoute {
+  /** The flag that named the destination in this run, when one did. */
+  namedBy: string | undefined;
+  /** How to make the move on purpose, for a run that refused to. */
+  move: string[];
+  /** What to do instead, for a user who declined the move. */
+  keep: string;
 }
 
 function recordProject(ctx: SetupContext): void {
@@ -1483,7 +1602,10 @@ const acquireProjectKey: StageDefinition = {
     const project = requireProject(ctx);
 
     // The user's own key is already scoped to this project (the single-credential
-    // shape TraceRoot ships today). Minting a second key would be pure noise.
+    // shape TraceRoot ships today). Minting a second key would be pure noise —
+    // unless the key would go over the env file's own, or is one that can
+    // manage keys; see `settleSessionKey`.
+    let settledEnvFile = false;
     if (ctx.project?.origin === "from-whoami" || ctx.project?.origin === "existing") {
       const userKey = session.userKey;
       const client = deps.createClient({
@@ -1491,23 +1613,18 @@ const acquireProjectKey: StageDefinition = {
         auth: { kind: "api-key", key: userKey.reveal() },
         timeoutMs: 15_000,
       });
+      let who: Awaited<ReturnType<ApiClient["whoami"]>> | undefined;
       try {
-        const who = await client.whoami();
-        if (who.project_id === project.projectId) {
-          ctx.credential = {
-            key: userKey,
-            keyId: null,
-            keyName: who.key_name,
-            projectId: project.projectId,
-            expiresAt: null,
-            origin: "existing-config",
-          };
-          ctx.checkpoint.projectKeyHint = userKey.hint;
-          wizardProgress(ctx, "Using the existing project-scoped API key.");
-          return "skipped";
-        }
+        who = await client.whoami();
       } catch {
         // Fall through to the reuse/mint path below.
+      }
+      if (who?.project_id === project.projectId) {
+        if (await settleSessionKey(ctx, deps, session, project, who)) {
+          return "skipped";
+        }
+        // The env file has been read and answered for; what is left is the mint.
+        settledEnvFile = true;
       }
     }
 
@@ -1516,7 +1633,7 @@ const acquireProjectKey: StageDefinition = {
     // Reuse before minting: a key already in the project's env file that authenticates to
     // the selected project is the right key, and a rerun of setup must not
     // accumulate a new credential every time.
-    const reused = await reuseExistingKey(ctx, deps, project.projectId);
+    const reused = settledEnvFile ? null : await reuseExistingKey(ctx, deps, project.projectId);
     if (reused !== null) {
       ctx.credential = reused;
       ctx.checkpoint.projectKeyHint = reused.key.hint;
@@ -1557,14 +1674,7 @@ const acquireProjectKey: StageDefinition = {
       scope: "ingest",
       authenticatedBy: "project-key",
     });
-    ctx.credential = {
-      key: makeSecret(created.key),
-      keyId: created.id,
-      keyName: created.name,
-      projectId: project.projectId,
-      expiresAt: created.expires_at,
-      origin: "minted",
-    };
+    ctx.credential = mintedCredential(created, project.projectId);
     ctx.checkpoint.projectKeyId = created.id;
     ctx.checkpoint.projectKeyHint = ctx.credential.key.hint;
     // The plaintext key is deliberately not printed. It goes into the child's
@@ -1574,6 +1684,105 @@ const acquireProjectKey: StageDefinition = {
     return "ok";
   },
 };
+
+/**
+ * Settles the application's key on a key session whose own key belongs to the
+ * selected project, or returns false when one has to be minted for it.
+ *
+ * The session key used to be taken whatever the env file held, and
+ * `configure_repository` then wrote it there: over another project's working
+ * key, which moved the repository without a word, and — once `traceroot
+ * logout` left the CLI's own config key as the session — over the application's
+ * key with one that can manage keys. So it is taken only where writing it loses
+ * nothing:
+ *
+ * - The application already finds this key, or the env file already holds it:
+ *   nothing is written, so it is taken as before.
+ * - The env file holds another working key for this project: that key is kept,
+ *   exactly as `reuseExistingKey` keeps one on the other path.
+ * - It holds one for another project: that is the move
+ *   {@link confirmProjectSwitch} asks about, and a run nobody watches stops
+ *   unless `--api-key` named the key in this run.
+ * - The key is the CLI's own from its config, and admin-scoped: an ingest key is
+ *   minted for the application instead, which the admin key is the one
+ *   credential able to do. A key this run was handed — `--api-key`, an env
+ *   file, the prompt — is the one the user chose for the application and is
+ *   written as before, and so is any key on a deployment that does not report
+ *   scopes.
+ */
+async function settleSessionKey(
+  ctx: SetupContext,
+  deps: SetupDeps,
+  session: NonNullable<SetupContext["session"]>,
+  project: ProjectSelection,
+  who: Awaited<ReturnType<ApiClient["whoami"]>>,
+): Promise<boolean> {
+  const key = session.userKey.reveal();
+  const take = (): true => {
+    ctx.credential = {
+      key: session.userKey,
+      keyId: null,
+      keyName: who.key_name,
+      projectId: project.projectId,
+      expiresAt: null,
+      origin: "existing-config",
+    };
+    ctx.checkpoint.projectKeyHint = session.userKey.hint;
+    wizardProgress(ctx, "Using the existing project-scoped API key.");
+    return true;
+  };
+
+  if (applicationCanResolve(ctx, deps, key) || holdsKey(envFileKey(credentialEnvPath(ctx)), key)) {
+    return take();
+  }
+
+  const existing = await repositoryKey(ctx, deps, session.host, "acquire_project_key");
+  if (existing !== null) {
+    if (existing.who.project_id === project.projectId && !isAdminScoped(existing.who)) {
+      ctx.credential = reusedCredential(ctx, existing, project.projectId);
+      ctx.checkpoint.projectKeyHint = ctx.credential.key.hint;
+      wizardProgress(ctx, "Reusing the existing project API key.");
+      return true;
+    }
+    await confirmProjectSwitch(
+      ctx,
+      deps,
+      existing,
+      project,
+      [
+        {
+          project_id: who.project_id,
+          project_name: who.project_name ?? who.project_id,
+          workspace_id: who.workspace_id,
+          workspace_name: who.workspace_name,
+        },
+      ],
+      "acquire_project_key",
+      {
+        namedBy:
+          session.via === "flag"
+            ? "--api-key"
+            : ctx.flags.project === undefined
+              ? undefined
+              : "--project",
+        move: [
+          "To move this repository to that project, pass that project's key:",
+          "  traceroot setup --api-key <key>",
+        ],
+        keep: "To set it up where it is, rerun with that project's key: `traceroot setup --api-key <key>`.",
+      },
+    );
+  }
+
+  if (session.via !== "existing-config" || !isAdminScoped(who)) {
+    return take();
+  }
+  wizardProgress(
+    ctx,
+    "That key can manage the project's keys, so the application gets a send-only key of its own.",
+  );
+  return false;
+}
 
 /**
  * The project's env files with the credential's own at the head of the list.
@@ -1787,13 +1996,34 @@ async function reuseExistingKey(
     });
   }
 
+  return reusedCredential(ctx, existing, projectId);
+}
+
+/** A key already in the repository's env file, kept as the application's. */
+function reusedCredential(
+  ctx: SetupContext,
+  existing: RepositoryKey,
+  projectId: string,
+): ProjectCredential {
   return {
     key: makeSecret(existing.key),
     keyId: ctx.checkpoint.projectKeyId ?? null,
-    keyName: who.key_name,
+    keyName: existing.who.key_name,
     projectId,
     expiresAt: null,
     origin: "reused",
+  };
+}
+
+/** A key this run minted for the application. */
+function mintedCredential(created: CreatedApiKey, projectId: string): ProjectCredential {
+  return {
+    key: makeSecret(created.key),
+    keyId: created.id,
+    keyName: created.name,
+    projectId,
+    expiresAt: created.expires_at,
+    origin: "minted",
   };
 }
 
@@ -1924,10 +2154,23 @@ const configureRepository: StageDefinition = {
     if (session.host !== DEFAULT_HOST) {
       updates[HOST_ENV] = session.host;
     }
+    // What the file said first, because a rerun writes over the project's own
+    // file: undoing a value it replaced means putting that value back.
+    const before = readIfPresent(envPath);
     const result = upsertEnvFile(envPath, updates);
+    const held = before === null ? {} : parseEnvFile(before);
     // `created`, because undoing a write and undoing a file are different
     // things and only the writer knows which this was.
-    wroteEnvKeys.set(ctx, { path: envPath, keys: result.written, created: result.created });
+    wroteEnvKeys.set(ctx, {
+      path: envPath,
+      keys: result.written,
+      created: result.created,
+      previous: Object.fromEntries(
+        result.written.flatMap((key) => (held[key] === undefined ? [] : [[key, held[key]]])),
+      ),
+      before,
+      after: result.written.length === 0 ? null : readIfPresent(envPath),
+    });
     // The file is the project's and holds a usable key either way, so the
     // closing notice and the report can name it whether or not this run was the
     // one that put the key there.
@@ -1954,8 +2197,26 @@ const configureRepository: StageDefinition = {
 /** The file and keys this run wrote, so a failure can roll them back. */
 const wroteEnvKeys = new WeakMap<
   SetupContext,
-  { path: string; keys: string[]; created: boolean }
+  {
+    path: string;
+    keys: string[];
+    created: boolean;
+    /** Each written key that already had a value, with that value. */
+    previous: Record<string, string>;
+    /** The file as it was before this run wrote it, and just after. */
+    before: string | null;
+    after: string | null;
+  }
 >();
+
+/** A file's contents, or null when it is not there or cannot be read. */
+function readIfPresent(path: string): string | null {
+  try {
+    return existsSync(path) ? readFileSync(path, "utf8") : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Says so when the file now holding a live key is not ignored by git.
@@ -3545,7 +3806,8 @@ function describeKeys(keys: readonly MintedKey[]): string {
  * Only the keys this run wrote come out, so every other line in the file is
  * left exactly as it was; `configure_repository` writes into one of the
  * project's own files, which may be full of things that have nothing to do with
- * TraceRoot.
+ * TraceRoot. A key the file already had is put back rather than taken out — see
+ * {@link restoreReplacedValues}.
  *
  * A file this run *created* is removed outright once nothing but its own header
  * is left in it. That header says "Created by `traceroot setup`. This file
@@ -3560,6 +3822,10 @@ function restoreEnvFile(ctx: SetupContext): void {
     return;
   }
   const shown = relativeToRoot(ctx.root, written.path);
+  if (Object.keys(written.previous).length > 0) {
+    restoreReplacedValues(ctx, written, shown);
+    return;
+  }
   try {
     const removed = removeEnvKeys(written.path, written.keys);
     if (written.created && holdsNothingButComments(written.path)) {
@@ -3574,6 +3840,44 @@ function restoreEnvFile(ctx: SetupContext): void {
     wizardWarn(
       ctx,
       `could not take ${written.keys.join(", ")} back out of ${shown}; that line names a key this run did not finish setting up, so remove it by hand`,
+    );
+  }
+}
+
+/**
+ * Puts back the values this run wrote over, and takes out the keys it added.
+ *
+ * Deleting a replaced line was a full undo only while setup wrote a file of its
+ * own. Now that it writes the project's, a rerun that replaced a working
+ * `TRACEROOT_API_KEY` and then failed, or was cancelled, left the application
+ * with no key at all — under a closing line saying nothing was changed.
+ *
+ * Byte for byte when nothing has touched the file since this run wrote it, so
+ * the line comes back as it was spelt, an `export` or quotes included. When
+ * something has, key by key, so that change survives too.
+ */
+function restoreReplacedValues(
+  ctx: SetupContext,
+  written: NonNullable<ReturnType<typeof wroteEnvKeys.get>>,
+  shown: string,
+): void {
+  const replaced = Object.keys(written.previous);
+  const added = written.keys.filter((key) => !replaced.includes(key));
+  try {
+    if (written.before !== null && readFileSync(written.path, "utf8") === written.after) {
+      writeFileSync(written.path, written.before, { mode: 0o600 });
+    } else {
+      removeEnvKeys(written.path, added);
+      upsertEnvFile(written.path, written.previous);
+    }
+    wizardProgress(ctx, `Restored the previous ${replaced.join(", ")} in ${shown}.`);
+    if (added.length > 0) {
+      wizardProgress(ctx, `Removed ${added.join(", ")} from ${shown}.`);
+    }
+  } catch {
+    wizardWarn(
+      ctx,
+      `could not put the previous ${replaced.join(", ")} back into ${shown}; it now names a key this run did not finish setting up, so restore it by hand`,
     );
   }
 }

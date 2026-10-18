@@ -223,6 +223,8 @@ export interface MakeDepsOptions {
   hiddenAnswers?: string[];
   sdk?: ResolvedSdk;
   onWriteConfig?: (config: { api_key: string; host_url: string }) => void;
+  /** The CLI's config as an earlier run left it; none by default, as on a first run. */
+  config?: { api_key?: string; host_url?: string } | null;
   tempDir?: string;
   /** Whether a local TraceRoot API answers, for the missing-endpoint hint. */
   localHostResponds?: boolean;
@@ -283,6 +285,7 @@ export function makeDeps(options: MakeDepsOptions = {}): SetupDeps {
     promptHidden: async () => hidden.shift() ?? "",
     resolveSdk: async () => options.sdk ?? TEST_SDK,
     writeConfig: options.onWriteConfig ?? (() => undefined),
+    readConfig: () => options.config ?? null,
     sleep: async () => undefined,
     makeTempDir: () => options.tempDir ?? "/tmp/traceroot-setup-test",
     probeHost: async () => options.localHostResponds ?? false,
