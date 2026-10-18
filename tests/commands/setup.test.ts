@@ -1291,16 +1291,23 @@ describe("finding a previous, unfinished run", () => {
     writeCheckpoint(dir, checkpoint);
 
     const { writers, err } = makeWriters();
-    await runSetup({
+    const result = await runSetup({
       ctx: ctxWith(),
       cwd: dir,
-      flags: defaultFlags({ agent: "claude", manual: true }),
+      // `--manual`, which reaches the run as this method. It was spelled
+      // `manual: true` here, a flag `SetupFlags` has never had, so the run took
+      // the default method instead and nothing noticed.
+      flags: defaultFlags({ agent: "claude", method: "manual" }),
       writers,
       canPrompt: false,
       setupDeps: makeDeps({ auth: authWithKey(), traces: [traceRow()] }),
     });
 
     expect(err.data).toContain("pass --resume to continue it");
+    // And it did not resume: the run is on a checkpoint of its own, not the one
+    // it found. The message alone would pass for a run that printed it and then
+    // carried on from the old checkpoint anyway.
+    expect(result.checkpoint.startedAt).not.toBe(checkpoint.startedAt);
   });
 });
 
