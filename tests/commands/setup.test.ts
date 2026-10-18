@@ -1054,7 +1054,7 @@ describe("a hand-over nothing has acted on yet", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [] }),
+        traces: [],
         runProcess: fakeRunProcess().run,
       }),
     });

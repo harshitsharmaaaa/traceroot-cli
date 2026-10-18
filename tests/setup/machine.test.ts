@@ -6663,8 +6663,8 @@ describe("why no trace arrived", () => {
       auth: authWithKey(),
       client: fakeApiClient({
         whoamiResult: async () => whoami({ project_id: "p_other" }),
-        traces: [],
       }),
+      traces: [],
       setupApi: fakeSetupApi({
         listProjects: async () => [
           { project_id: "p_1", project_name: "demo", workspace_id: "w_1" },
@@ -6791,7 +6791,7 @@ describe("why no trace arrived", () => {
       ctx,
       makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess().run,
       }),
     );
