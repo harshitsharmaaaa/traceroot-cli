@@ -148,6 +148,14 @@ export interface SetupApi {
     expiresInDays: number | null;
   }): Promise<CreatedApiKey>;
   revokeApiKey(keyId: string): Promise<void>;
+  /**
+   * Revokes a key in a project the *user* can reach, authenticated by a CLI
+   * token like {@link createProjectApiKey}.
+   *
+   * `revokeApiKey` cannot do this for a key minted on a sign-in: its route
+   * accepts only an admin API key, which a user's own credential is not.
+   */
+  revokeProjectApiKey(projectId: string, keyId: string): Promise<void>;
 }
 
 interface RequestOptions {
@@ -368,6 +376,12 @@ export function createSetupApi(opts: SetupApiOptions): SetupApi {
       await request<void>({
         method: "DELETE",
         path: `/api/v1/public/api-keys/${encodeURIComponent(keyId)}`,
+      });
+    },
+    async revokeProjectApiKey(projectId, keyId) {
+      await request<void>({
+        method: "DELETE",
+        path: `/api/v1/public/projects/${encodeURIComponent(projectId)}/api-keys/${encodeURIComponent(keyId)}`,
       });
     },
   };

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,10 +33,14 @@ import {
 } from "../auth/token.js";
 import { DEFAULT_HOST } from "../commands/constants.js";
 import { loadOptionalEnvFileFromDisk, parseEnvFile } from "../config/envFile.js";
-import { readConfig as realReadConfig, writeConfig as realWriteConfig } from "../config/manager.js";
+import {
+  readConfig as realReadConfig,
+  readConfigText as realReadConfigText,
+  restoreConfigText as realRestoreConfigText,
+  writeConfig as realWriteConfig,
+} from "../config/manager.js";
 import { type ResolvedAuth, normalizeApiKey } from "../config/resolve.js";
 import { ExitCode, type Writers } from "../output.js";
-import type { Prompt } from "../prompt.js";
 import { bundledSkillDir } from "../skills/bundled.js";
 import { installBundledSkill } from "../skills/install.js";
 import { sleep } from "../util/sleep.js";
@@ -150,8 +154,12 @@ export interface SetupDeps {
   }) => SetupApi;
   /** Returns false when the browser could not be opened; the URL is still printed. */
   openBrowser: (url: string) => Promise<boolean>;
-  prompt: Prompt;
-  promptHidden: (question: string) => Promise<string>;
+  /**
+   * A typed answer. `stage` is the one an interrupt is blamed on, as a `select`
+   * names its own; a question asked outside the pipeline names none.
+   */
+  prompt: (question: string, stage?: SetupStage) => Promise<string>;
+  promptHidden: (question: string, stage: SetupStage) => Promise<string>;
   resolveSdk: (pkg: SdkPackage) => Promise<ResolvedSdk>;
   writeConfig: (config: { api_key: string; host_url: string }) => void;
   /**
@@ -159,6 +167,13 @@ export interface SetupDeps {
    * where a rerun finds the CLI key it already has rather than minting another.
    */
   readConfig: () => { api_key?: string; host_url?: string } | null;
+  /**
+   * The same file's text as it is on disk, null when there is none; and putting
+   * text back, null removing the file. Byte for byte, because a rollback that
+   * revokes the key this run wrote there puts back exactly what it replaced.
+   */
+  readConfigText: () => string | null;
+  restoreConfigText: (text: string | null) => void;
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Interactive single choice; injected so stages stay testable without a TTY. */
   select: SelectFn;
@@ -203,45 +218,21 @@ export function defaultSetupDeps(resolvedAuth: ResolvedAuth): SetupDeps {
     // captured output: the only consumer treats the boolean as "say the URL out
     // loud as well", so there was nothing to keep.
     openBrowser: openBrowserForPlatform,
-    // Both readline prompts drain first, for the same reason every `select`
-    // does (see `discardTypeAhead`). The two closing acknowledgements are
-    // consecutive questions with a block of prose between them, so a spare
-    // Enter at the first scrolls the second past a user who never read it.
-    prompt: async (question) => {
-      await discardTypeAhead(process.stdin);
-      return (await import("../prompt.js")).readLine(question);
-    },
-    promptHidden: async (question) => {
-      const { createInterface } = await import("node:readline");
-      await discardTypeAhead(process.stdin);
-      return new Promise((resolve) => {
-        const rl = createInterface({
-          input: process.stdin,
-          output: process.stdout,
-          terminal: true,
-        });
-        const mutable = rl as unknown as { _writeToOutput?: (s: string) => void };
-        const original = mutable._writeToOutput?.bind(rl);
-        mutable._writeToOutput = (chunk: string): void => {
-          if (chunk.includes(question)) {
-            original?.(chunk);
-          } else {
-            process.stdout.write("*");
-          }
-        };
-        rl.question(question, (answer) => {
-          rl.close();
-          process.stdout.write("\n");
-          resolve(answer);
-        });
-      });
-    },
+    prompt: (question, stage) =>
+      readAnswer({ input: process.stdin, output: process.stdout }, question, { stage }),
+    promptHidden: (question, stage) =>
+      readAnswer({ input: process.stdin, output: process.stdout }, question, {
+        stage,
+        masked: true,
+      }),
     resolveSdk: (pkg) => resolveSdkVersion(pkg),
     writeConfig: realWriteConfig,
     readConfig: () => {
       const read = realReadConfig();
       return read.ok ? read.config : null;
     },
+    readConfigText: () => realReadConfigText(),
+    restoreConfigText: (text) => realRestoreConfigText(text),
     sleep,
     select: interactiveSelect,
     makeTempDir: () => mkdtempSync(join(tmpdir(), "traceroot-setup-")),
@@ -263,6 +254,61 @@ export function defaultSetupDeps(resolvedAuth: ResolvedAuth): SetupDeps {
       }
     },
   };
+}
+
+/**
+ * One typed answer from the terminal: the production `prompt` and
+ * `promptHidden`, against a given terminal so a test can press the keys.
+ *
+ * Its own readline rather than the shared `readLine`, for the interrupt. Ctrl+C
+ * reaches readline as a keypress in raw mode, and with no `SIGINT` listener
+ * readline just closes: the question never settles, the event loop drains, and
+ * the process exits 0, so `traceroot setup && <next step>` carried on through
+ * the keypress meant to stop it. A question that names its stage raises
+ * `INTERRUPTED` instead, as the selector does (see `select.ts`). One that names
+ * none behaves exactly as `readLine` does.
+ */
+export async function readAnswer(
+  terminal: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream },
+  question: string,
+  options: { stage?: SetupStage; masked?: boolean } = {},
+): Promise<string> {
+  const { createInterface } = await import("node:readline");
+  // Drained first, for the same reason every `select` is (see
+  // `discardTypeAhead`). The two closing acknowledgements are consecutive
+  // questions with a block of prose between them, so a spare Enter at the first
+  // scrolls the second past a user who never read it.
+  await discardTypeAhead(terminal.input);
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({ input: terminal.input, output: terminal.output, terminal: true });
+    if (options.masked === true) {
+      const mutable = rl as unknown as { _writeToOutput?: (s: string) => void };
+      const original = mutable._writeToOutput?.bind(rl);
+      mutable._writeToOutput = (chunk: string): void => {
+        if (chunk.includes(question)) {
+          original?.(chunk);
+        } else {
+          terminal.output.write("*");
+        }
+      };
+    }
+    const { stage } = options;
+    if (stage !== undefined) {
+      rl.on("SIGINT", () => {
+        rl.close();
+        // Nothing echoed the keypress, so the next line would start on this one.
+        terminal.output.write("\n");
+        reject(new SetupError({ stage, code: "INTERRUPTED", message: "Setup interrupted." }));
+      });
+    }
+    rl.question(question, (answer) => {
+      rl.close();
+      if (options.masked === true) {
+        terminal.output.write("\n");
+      }
+      resolve(answer);
+    });
+  });
 }
 
 /** One stage: a satisfaction predicate plus the work. */
@@ -571,7 +617,7 @@ const authenticate: StageDefinition = {
     // `Invalid API key` for a key that is perfectly valid. Before the empty
     // check, so pasting a bare `TRACEROOT_API_KEY=` is caught here rather than
     // sent.
-    const pasted = normalizeApiKey(await deps.promptHidden("TraceRoot API key: "));
+    const pasted = normalizeApiKey(await deps.promptHidden("TraceRoot API key: ", "authenticate"));
     if (pasted === "") {
       throw new SetupError({
         stage: "authenticate",
@@ -980,7 +1026,16 @@ async function userCredentialSignIn(
       .createClient({ host, auth: { kind: "api-key", key: key.reveal() }, timeoutMs: 15_000 })
       .whoami());
 
+  // What the config held before a key this run minted goes into it — a key the
+  // rollback may revoke — so that it can be put back rather than left naming a
+  // dead key. Only a mint has an id. A reused key is still good, and the config
+  // holding it is left alone.
+  const replaced = "id" in cli ? configText(deps) : undefined;
   deps.writeConfig({ api_key: cli.key, host_url: host });
+  const written = replaced === undefined ? undefined : configText(deps);
+  if ("id" in cli && replaced !== undefined && typeof written === "string") {
+    wroteConfig.set(ctx, { keyId: cli.id, key: cli.key, before: replaced, after: written });
+  }
 
   ctx.session = {
     host,
@@ -1428,7 +1483,7 @@ async function chooseProject(
     // asked. Without it the server refuses any user who belongs to more than one
     // workspace, and the CLI would have no way to answer.
     const targetWorkspace = workspaceId ?? (await chooseWorkspace(ctx, deps, api, stage));
-    const name = (await deps.prompt(`New project name [${basename(ctx.root)}]: `)).trim();
+    const name = (await deps.prompt(`New project name [${basename(ctx.root)}]: `, stage)).trim();
     const created = await api.createProject(
       name === "" ? basename(ctx.root) : name,
       targetWorkspace,
@@ -1703,12 +1758,12 @@ const acquireProjectKey: StageDefinition = {
  * - It holds one for another project: that is the move
  *   {@link confirmProjectSwitch} asks about, and a run nobody watches stops
  *   unless `--api-key` named the key in this run.
- * - The key is the CLI's own from its config, and admin-scoped: an ingest key is
- *   minted for the application instead, which the admin key is the one
- *   credential able to do. A key this run was handed — `--api-key`, an env
- *   file, the prompt — is the one the user chose for the application and is
- *   written as before, and so is any key on a deployment that does not report
- *   scopes.
+ * - The key is admin-scoped: an ingest key is minted for the application
+ *   instead, which the admin key is the one credential able to do. That holds
+ *   for a key this run was handed as much as for the CLI's own — `--api-key`,
+ *   an env file and the prompt included — because the application carries its
+ *   key into every deployment, and none of them needs to manage keys. A key on
+ *   a deployment that does not report scopes is written as before.
  */
 async function settleSessionKey(
   ctx: SetupContext,
@@ -1774,7 +1829,7 @@ async function settleSessionKey(
     );
   }
 
-  if (session.via !== "existing-config" || !isAdminScoped(who)) {
+  if (!isAdminScoped(who)) {
     return take();
   }
   wizardProgress(
@@ -1821,6 +1876,13 @@ interface MintedKey {
    * there and silently revoke neither.
    */
   api: SetupApi;
+  /**
+   * Which route minted it, because that decides the route that can revoke it:
+   * a key minted on the user's credential is revoked on it too, through the
+   * route that names the project.
+   */
+  authenticatedBy: MintRequest["authenticatedBy"];
+  projectId: string;
 }
 
 /**
@@ -1896,6 +1958,8 @@ async function mintRecordedKey(
     name: created.name,
     hint: created.hint,
     api,
+    authenticatedBy: request.authenticatedBy,
+    projectId: request.projectId,
   };
   mintedKeys.set(ctx, [...(mintedKeys.get(ctx) ?? []), entry]);
   ctx.checkpoint.mintedKeys = [
@@ -2187,12 +2251,28 @@ const configureRepository: StageDefinition = {
     wizardProgress(
       ctx,
       target.existed
-        ? `Wrote ${result.written.join(", ")} to ${envEntry} (0600).`
-        : `Created ${envEntry} with ${result.written.join(", ")} (0600).`,
+        ? `Wrote ${result.written.join(", ")} to ${envEntry}${modeNote(envPath)}.`
+        : `Created ${envEntry} with ${result.written.join(", ")}${modeNote(envPath)}.`,
     );
     return "ok";
   },
 };
+
+/**
+ * ` (0600)`: the mode a file has now, for the line that reports writing it.
+ *
+ * Read back rather than stated. A file this stage creates is 0600, but whether
+ * one the project already had is tightened to match is the writer's decision,
+ * not this line's — and a constant here would claim a protection the file may
+ * not have. Nothing at all when the mode cannot be read.
+ */
+function modeNote(path: string): string {
+  try {
+    return ` (${(statSync(path).mode & 0o777).toString(8).padStart(4, "0")})`;
+  } catch {
+    return "";
+  }
+}
 
 /** The file and keys this run wrote, so a failure can roll them back. */
 const wroteEnvKeys = new WeakMap<
@@ -3232,7 +3312,7 @@ async function confirmAgentLaunch(
     message: `Setup will now run ${agentName} with permission to edit files in this repository. Proceed?`,
     options: [
       { value: "confirm", label: "Confirm", hint: `run ${agentName}` },
-      { value: "abort", label: "Abort", hint: "change nothing" },
+      { value: "abort", label: "Abort", hint: `cancel setup without running ${agentName}` },
     ],
     initialValue: "confirm",
   });
@@ -3241,7 +3321,7 @@ async function confirmAgentLaunch(
     throw new SetupError({
       stage: "instrument",
       code: "CANCELLED",
-      message: `Setup cancelled — ${agentName} was not run and nothing was changed.`,
+      message: `Setup cancelled — ${agentName} was not run, so no code was changed.${keptOnCancel(ctx)}`,
       remedy: [
         "To get the same instructions without an agent editing anything:",
         "  traceroot setup --no-instrument     writes the task for your own agent",
@@ -3249,6 +3329,35 @@ async function confirmAgentLaunch(
       ].join("\n"),
     });
   }
+}
+
+/**
+ * What a run cancelled at the launch keeps: ` Setup kept …`, or nothing.
+ *
+ * The cancel used to close on "nothing was changed", which by this question is
+ * false: the skill is installed, and a sign-in has written the CLI's config. The
+ * rollback that follows takes back the keys this run minted and what it wrote
+ * to the env file, and names each, including any key it could not revoke. It
+ * never touches the skill. It puts the config back when the key there is one
+ * this run minted and then revokes, and says which it did; a config holding a
+ * key this run did not mint, it leaves. Worked out before the rollback runs, so
+ * this claims only what the rollback is certain to leave.
+ */
+function keptOnCancel(ctx: SetupContext): string {
+  const kept: string[] = [];
+  const skill = requireAgent(requireDetectedAgent(ctx).id).getSkillInstallPath(
+    ctx.root,
+    SKILL_NAME,
+  );
+  if (existsSync(skill)) {
+    kept.push(`the TraceRoot skill in ${displaySkillPath(ctx.root, skill)}`);
+  }
+  // The two routes that sign in on the user's behalf write it, and no other does.
+  const wroteIt = ctx.session?.via === "user-credential" || ctx.session?.via === "pasted-key";
+  if (wroteIt && !wroteConfig.has(ctx)) {
+    kept.push("the CLI's config");
+  }
+  return kept.length === 0 ? "" : ` Setup kept ${kept.join(" and ")}.`;
 }
 
 // ── VERIFY_APPLICATION ──────────────────────────────────────────────────────
@@ -3724,8 +3833,8 @@ export async function runSetupMachine(ctx: SetupContext, deps: SetupDeps): Promi
  * revoked the key the resume would have needed. The failure says which ending
  * it is now — see {@link PausedSetupError}.
  *
- * Both halves work from what this run recorded as it went, never from a path or
- * a credential recomputed here, so neither can reach anything a previous run
+ * Every part works from what this run recorded as it went, never from a path
+ * or a credential recomputed here, so none can reach anything a previous run
  * left behind.
  */
 async function rollback(ctx: SetupContext, deps: SetupDeps, error: SetupError): Promise<void> {
@@ -3733,7 +3842,8 @@ async function rollback(ctx: SetupContext, deps: SetupDeps, error: SetupError): 
     return;
   }
 
-  await revokeMintedKeys(ctx, deps);
+  const revoked = await revokeMintedKeys(ctx, deps);
+  restoreCliConfig(ctx, deps, revoked);
   restoreEnvFile(ctx);
 }
 
@@ -3749,19 +3859,31 @@ async function rollback(ctx: SetupContext, deps: SetupDeps, error: SetupError): 
  * still live with where to remove them. A revoke needs the network and a
  * session, which are two of the things that fail in the first place; claiming a
  * rollback that did not happen would leave the user believing a live key is
- * gone.
+ * gone. So does a deployment without the route for a sign-in's keys, and a
+ * user whose role may mint a key but not revoke one.
+ *
+ * Each key goes back through the kind of credential that minted it. The two
+ * keys a sign-in mints used to be sent to the key-authenticated route on the
+ * user's token, which that route refuses outright, so every one of them was
+ * reported as still live.
+ *
+ * Returns the ids it revoked.
  */
-async function revokeMintedKeys(ctx: SetupContext, deps: SetupDeps): Promise<void> {
+async function revokeMintedKeys(ctx: SetupContext, deps: SetupDeps): Promise<ReadonlySet<string>> {
   const minted = mintedKeys.get(ctx) ?? [];
   if (minted.length === 0) {
-    return;
+    return new Set();
   }
 
   const revoked: MintedKey[] = [];
   const kept: MintedKey[] = [];
   for (const key of minted) {
     try {
-      await key.api.revokeApiKey(key.id);
+      if (key.authenticatedBy === "user") {
+        await key.api.revokeProjectApiKey(key.projectId, key.id);
+      } else {
+        await key.api.revokeApiKey(key.id);
+      }
       revoked.push(key);
     } catch {
       kept.push(key);
@@ -3785,6 +3907,7 @@ async function revokeMintedKeys(ctx: SetupContext, deps: SetupDeps): Promise<voi
     (key) => !mine.has(key.id) || remaining.has(key.id),
   );
   writeCheckpoint(ctx.artifactDir, ctx.checkpoint);
+  return new Set(revoked.map((key) => key.id));
 }
 
 /** `name (hint)` for each, which is how the dashboard's key list reads. */
@@ -3895,6 +4018,112 @@ function holdsNothingButComments(path: string): boolean {
   return content
     .split("\n")
     .every((line) => line.trim() === "" || line.trimStart().startsWith("#"));
+}
+
+/**
+ * What a sign-in wrote into the CLI's config, when the key it wrote is one this
+ * run minted and the file could be read either side of the write: the key and
+ * its id, and the file's text before (null for no file) and just after. Present
+ * exactly when the rollback will act on the config.
+ */
+const wroteConfig = new WeakMap<
+  SetupContext,
+  { keyId: string; key: string; before: string | null; after: string }
+>();
+
+/** The CLI config's text, null when there is none, or undefined when it cannot be read. */
+function configText(deps: SetupDeps): string | null | undefined {
+  try {
+    return deps.readConfigText();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Puts the CLI's config back once the rollback has revoked the key this run
+ * wrote into it.
+ *
+ * Left as it was, every later command would sign in with a key that no longer
+ * exists: hidden while a saved sign-in outranks it, and the first thing to fail
+ * after `traceroot logout`. The same rule as the env file: byte for byte when
+ * nothing has touched the file since this run wrote it, and field by field when
+ * something has, so that change survives. A field something else has changed
+ * since is that thing's, and is left alone.
+ *
+ * A key the rollback could not revoke still works, so the config holding it is
+ * kept, and said to be, under the line naming that key as still live.
+ */
+function restoreCliConfig(ctx: SetupContext, deps: SetupDeps, revoked: ReadonlySet<string>): void {
+  const wrote = wroteConfig.get(ctx);
+  if (wrote === undefined) {
+    return;
+  }
+  try {
+    const now = deps.readConfigText();
+    // Removed since, or holding another key: it no longer names this run's.
+    if (now === null || !namesKey(now, wrote.key)) {
+      return;
+    }
+    if (!revoked.has(wrote.keyId)) {
+      wizardProgress(ctx, "Kept the CLI's config, since the key in it still works.");
+      return;
+    }
+    const restored = now === wrote.after ? wrote.before : configFieldsRestored(now, wrote);
+    deps.restoreConfigText(restored);
+    wizardProgress(
+      ctx,
+      restored === null
+        ? "Removed the CLI's config, which this run created."
+        : wrote.before === null
+          ? "Removed the revoked key from the CLI's config."
+          : "Restored the CLI's previous config.",
+    );
+  } catch {
+    wizardWarn(
+      ctx,
+      "could not put the CLI's config back, and it names a key this run revoked; run `traceroot login` to replace it",
+    );
+  }
+}
+
+/**
+ * The config's text with every field still as this run's write left it put
+ * back as it was before — present with its old value, or absent — and every
+ * field something has changed since left as that thing left it. Null when that
+ * leaves nothing in a file this run created.
+ */
+function configFieldsRestored(
+  now: string,
+  wrote: NonNullable<ReturnType<typeof wroteConfig.get>>,
+): string | null {
+  const parse = (text: string | null): Record<string, unknown> =>
+    text === null ? {} : (JSON.parse(text) as Record<string, unknown>);
+  const current = parse(now);
+  const previous = parse(wrote.before);
+  const left = parse(wrote.after);
+  const restored: Record<string, unknown> = {};
+  for (const field of new Set([...Object.keys(current), ...Object.keys(previous)])) {
+    const untouched =
+      field in current ? field in left && current[field] === left[field] : !(field in left);
+    const from = untouched ? previous : current;
+    if (field in from) {
+      restored[field] = from[field];
+    }
+  }
+  if (wrote.before === null && Object.keys(restored).length === 0) {
+    return null;
+  }
+  return `${JSON.stringify(restored, null, 2)}\n`;
+}
+
+/** Whether a config's text holds `key` as its API key. */
+function namesKey(text: string, key: string): boolean {
+  try {
+    return (JSON.parse(text) as { api_key?: unknown } | null)?.api_key === key;
+  } catch {
+    return false;
+  }
 }
 
 /** Non-secret per-stage payload for the JSON event stream. */

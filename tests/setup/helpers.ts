@@ -286,6 +286,9 @@ export function makeDeps(options: MakeDepsOptions = {}): SetupDeps {
     resolveSdk: async () => options.sdk ?? TEST_SDK,
     writeConfig: options.onWriteConfig ?? (() => undefined),
     readConfig: () => options.config ?? null,
+    // No file behind the config by default, so a rollback finds nothing to put back.
+    readConfigText: () => null,
+    restoreConfigText: () => undefined,
     sleep: async () => undefined,
     makeTempDir: () => options.tempDir ?? "/tmp/traceroot-setup-test",
     probeHost: async () => options.localHostResponds ?? false,

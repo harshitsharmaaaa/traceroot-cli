@@ -1316,11 +1316,19 @@ describe("a repository that already reports to a project", () => {
       resumeFrom?: ReturnType<typeof newCheckpoint>;
       /** Called where the run fails, after the env file was written. */
       failAtInstrument?: () => void;
+      /**
+       * The CLI's config as a file, read and put back byte for byte, with every
+       * text put back recorded. Without it, the config has no file behind it.
+       */
+      configFile?: { text: string | null; restored: (string | null)[] };
+      /** The user route's answer to a revoke: done, or this error. None at all unless set. */
+      revoke?: "ok" | Error;
     },
   ) {
     const asked: Parameters<SetupDeps["select"]>[0][] = [];
     const calls: string[] = [];
     const configured: string[] = [];
+    const file = options.configFile;
     const base = makeDeps({
       auth: options.auth ?? authEmpty(),
       setupApi: fakeSetupApi({
@@ -1332,6 +1340,16 @@ describe("a repository that already reports to a project", () => {
           calls.push(`mint ${input.scope} ${input.projectId}`);
           return world.mint(input.projectId, input.name, input.scope);
         },
+        ...(options.revoke === undefined
+          ? {}
+          : {
+              revokeProjectApiKey: async (projectId: string, id: string) => {
+                calls.push(`revoke ${projectId} ${id}`);
+                if (options.revoke instanceof Error) {
+                  throw options.revoke;
+                }
+              },
+            }),
       }),
       client: fakeApiClient({ traces: [traceRow()] }),
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
@@ -1342,6 +1360,21 @@ describe("a repository that already reports to a project", () => {
     });
     const deps: SetupDeps = {
       ...base,
+      ...(file === undefined
+        ? {}
+        : {
+            writeConfig: (config: { api_key: string; host_url: string }) => {
+              configured.push(config.api_key);
+              // As `config/manager.ts` writes it.
+              file.text = `${JSON.stringify(config, null, 2)}\n`;
+            },
+            readConfig: () => (file.text === null ? null : JSON.parse(file.text)),
+            readConfigText: () => file.text,
+            restoreConfigText: (text: string | null) => {
+              file.restored.push(text);
+              file.text = text;
+            },
+          }),
       // The key-authenticated mint answers for the project of the key calling it,
       // as the server's does.
       createSetupApi: (opts) => ({
@@ -2034,12 +2067,53 @@ describe("a repository that already reports to a project", () => {
     expect(each.ctx.session?.userKey.reveal()).toBe("tr-cli-key");
   });
 
-  it("still writes an admin key this run was handed with --api-key, as the user's choice", async () => {
-    // The key the user names for this run is the single credential they chose;
-    // only the CLI's own config key is kept out of the application's env file.
+  it("gives the application a send-only key even for an admin key passed with --api-key", async () => {
+    // The application carries its key into every deployment, and none of them
+    // needs to manage keys, whoever chose the key the run signed in with.
     pythonRepo();
     const world = server(["tr-handed-admin", TEST_GLOBEX]);
+    world.settings.reportScopes = true;
     world.scopes.set("tr-handed-admin", "admin");
+    const each = setupRun(world, {
+      listed: [],
+      auth: flagKey("tr-handed-admin"),
+      canPrompt: false,
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error).toBeNull();
+    expect(mints(each.calls)).toEqual(["mint by key ingest p_t2"]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).not.toContain("tr-handed-admin");
+    expect(world.reportsTo()).toBe("p_t2");
+    expect(each.ctx.session?.userKey.reveal()).toBe("tr-handed-admin");
+    expect(plain(each.err.data)).toContain(
+      "That key can manage the project's keys, so the application gets a send-only key of its own.",
+    );
+  });
+
+  it("does the same for an admin key pasted at the prompt", async () => {
+    pythonRepo();
+    const world = server(["tr-pasted-admin", TEST_GLOBEX]);
+    world.scopes.set("tr-pasted-admin", "admin");
+    const each = setupRun(world, { listed: [] });
+    const deps: SetupDeps = {
+      ...each.deps,
+      readCredential: () => null,
+      promptHidden: async () => "tr-pasted-admin",
+    };
+
+    const result = await runSetupMachine(each.ctx, deps);
+
+    expect(result.error).toBeNull();
+    expect(each.ctx.session?.via).toBe("pasted-key");
+    expect(mints(each.calls)).toEqual(["mint by key ingest p_t2"]);
+    expect(readFileSync(join(dir, ".env"), "utf8")).not.toContain("tr-pasted-admin");
+  });
+
+  it("still writes an admin key as before where the deployment does not report scopes", async () => {
+    pythonRepo();
+    const world = server(["tr-handed-admin", TEST_GLOBEX]);
     const each = setupRun(world, {
       listed: [],
       auth: flagKey("tr-handed-admin"),
@@ -2130,6 +2204,311 @@ describe("a repository that already reports to a project", () => {
     const said = plain(each.err.data);
     expect(said).toContain("Restored the previous TRACEROOT_API_KEY in .env.");
     expect(said).toContain("Removed TRACEROOT_HOST_URL from .env.");
+  });
+
+  // ── what a cancel says it kept ────────────────────────────────────────────
+
+  const SKILL = ".claude/skills/traceroot-instrument-repo";
+
+  it("says what Abort does, rather than that it changes nothing", async () => {
+    pythonRepo();
+    const each = setupRun(server(), { listed: [ALPHA], answers: ["abort"] });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    const confirm = each.asked.find((input) => input.message.includes("Proceed?"));
+    expect(confirm?.options).toEqual([
+      { value: "confirm", label: "Confirm", hint: "run Claude Code" },
+      { value: "abort", label: "Abort", hint: "cancel setup without running Claude Code" },
+    ]);
+  });
+
+  // ── what a rollback does with the CLI's config ─────────────────────────────
+
+  const DEAD_CONFIG = `{"api_key":"tr-dead-cli","host_url":"${HOST}","project_id":"p_a"}`;
+  const configFile = (text: string | null = null) => ({
+    text,
+    restored: [] as (string | null)[],
+  });
+
+  it("leaves no config behind when a first run is cancelled after signing in", async () => {
+    // The config went on naming the CLI key the rollback had just revoked, so
+    // after `traceroot logout` every command signed in with a key that was gone.
+    pythonRepo();
+    const file = configFile();
+    const each = setupRun(server(), {
+      listed: [ALPHA],
+      answers: ["abort"],
+      configFile: file,
+      revoke: "ok",
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(result.error?.code).toBe("CANCELLED");
+    expect(each.configured).toHaveLength(1);
+    expect(file.text).toBeNull();
+    expect(file.restored).toEqual([null]);
+    const said = plain(each.err.data);
+    expect(said).toContain("Revoked the 2 API keys");
+    expect(said).toContain("Removed the CLI's config, which this run created.");
+    // Not claimed as kept: the rollback after it takes the config back.
+    expect(result.error?.message.split("\n")[0]).toBe(
+      `Setup cancelled — Claude Code was not run, so no code was changed. Setup kept the TraceRoot skill in ${SKILL}.`,
+    );
+    expect(existsSync(join(dir, SKILL))).toBe(true);
+  });
+
+  it("puts back, byte for byte, the config a rerun wrote over a dead key", async () => {
+    pythonRepo();
+    const world = server(["tr-dead-cli", ALPHA]);
+    world.refused.set("tr-dead-cli", "API key has expired");
+    const file = configFile(DEAD_CONFIG);
+    const each = setupRun(world, {
+      listed: [ALPHA],
+      answers: ["abort"],
+      configFile: file,
+      revoke: "ok",
+    });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    expect(each.configured).toEqual(["tr-admin-p_a-1"]);
+    expect(file.text).toBe(DEAD_CONFIG);
+    expect(plain(each.err.data)).toContain("Restored the CLI's previous config.");
+  });
+
+  it("puts it back field by field when something changed the file after the write", async () => {
+    pythonRepo();
+    const world = server(["tr-dead-cli", ALPHA]);
+    world.refused.set("tr-dead-cli", "API key has expired");
+    const file = configFile(DEAD_CONFIG);
+    const each = setupRun(world, {
+      listed: [ALPHA],
+      configFile: file,
+      revoke: "ok",
+      // Something else writing the config while the run is in flight.
+      failAtInstrument: () => {
+        file.text = JSON.stringify({ ...JSON.parse(file.text ?? "{}"), project_id: "p_new" });
+      },
+    });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    expect(JSON.parse(file.text ?? "")).toEqual({
+      api_key: "tr-dead-cli",
+      host_url: HOST,
+      project_id: "p_new",
+    });
+    expect(plain(each.err.data)).toContain("Restored the CLI's previous config.");
+  });
+
+  it("keeps a field changed since, and puts back one this run's write dropped", async () => {
+    // The write replaces the whole file, so `project_id` went with it; the host
+    // was then moved by something else, and that move is not this run's to undo.
+    pythonRepo();
+    const world = server(["tr-dead-cli", ALPHA]);
+    world.refused.set("tr-dead-cli", "API key has expired");
+    const file = configFile(DEAD_CONFIG);
+    const each = setupRun(world, {
+      listed: [ALPHA],
+      configFile: file,
+      revoke: "ok",
+      failAtInstrument: () => {
+        file.text = JSON.stringify({
+          ...JSON.parse(file.text ?? "{}"),
+          host_url: "https://moved.example.test",
+        });
+      },
+    });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    expect(JSON.parse(file.text ?? "")).toEqual({
+      api_key: "tr-dead-cli",
+      host_url: "https://moved.example.test",
+      project_id: "p_a",
+    });
+  });
+
+  it("takes only its own fields out of a config it created that something added to", async () => {
+    pythonRepo();
+    const file = configFile();
+    const each = setupRun(server(), {
+      listed: [ALPHA],
+      configFile: file,
+      revoke: "ok",
+      failAtInstrument: () => {
+        file.text = JSON.stringify({ ...JSON.parse(file.text ?? "{}"), project_id: "p_a" });
+      },
+    });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    expect(JSON.parse(file.text ?? "")).toEqual({ project_id: "p_a" });
+    expect(plain(each.err.data)).toContain("Removed the revoked key from the CLI's config.");
+  });
+
+  it("leaves the config alone when the run reused the CLI key in it", async () => {
+    pythonRepo();
+    const text = `${JSON.stringify({ api_key: "tr-cli-key", host_url: HOST }, null, 2)}\n`;
+    const file = configFile(text);
+    const each = setupRun(server(["tr-cli-key", ALPHA]), {
+      listed: [ALPHA],
+      answers: ["abort"],
+      configFile: file,
+      revoke: "ok",
+    });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(mints(each.calls)).toEqual(["mint ingest p_a"]);
+    expect(file.restored).toEqual([]);
+    expect(file.text).toBe(text);
+    expect(plain(each.err.data)).not.toContain("CLI's config");
+    // The one config the rollback is certain to leave, so the one named as kept.
+    expect(result.error?.message.split("\n")[0]).toBe(
+      `Setup cancelled — Claude Code was not run, so no code was changed. Setup kept the TraceRoot skill in ${SKILL} and the CLI's config.`,
+    );
+  });
+
+  it("keeps the config when the key in it could not be revoked, and says so", async () => {
+    pythonRepo();
+    const file = configFile();
+    const each = setupRun(server(), {
+      listed: [ALPHA],
+      answers: ["abort"],
+      configFile: file,
+      revoke: new BackendUnavailableError("/api/v1/public/projects/p_a/api-keys/ak_1", 404),
+    });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    expect(file.restored).toEqual([]);
+    expect(JSON.parse(file.text ?? "").api_key).toBe("tr-admin-p_a-1");
+    const said = plain(each.err.data);
+    expect(said).toContain("they are still live");
+    expect(said).toContain("Kept the CLI's config, since the key in it still works.");
+  });
+
+  it("leaves a config that names another key by the time of the rollback", async () => {
+    pythonRepo();
+    const file = configFile();
+    const other = `${JSON.stringify({ api_key: "tr-from-login", host_url: HOST }, null, 2)}\n`;
+    const each = setupRun(server(), {
+      listed: [ALPHA],
+      configFile: file,
+      revoke: "ok",
+      failAtInstrument: () => {
+        file.text = other;
+      },
+    });
+
+    await runSetupMachine(each.ctx, each.deps);
+
+    expect(file.restored).toEqual([]);
+    expect(file.text).toBe(other);
+    expect(plain(each.err.data)).not.toContain("CLI's config");
+  });
+
+  it("reads and puts back the CLI's own config file in production", async () => {
+    const { vi } = await import("vitest");
+    const path = join(dir, "cli-config.json");
+    vi.stubEnv("TRACEROOT_CONFIG_PATH", path);
+    try {
+      const deps = defaultSetupDeps(authEmpty());
+      expect(deps.readConfigText()).toBeNull();
+      deps.restoreConfigText(DEAD_CONFIG);
+      expect(readFileSync(path, "utf8")).toBe(DEAD_CONFIG);
+      expect(deps.readConfigText()).toBe(DEAD_CONFIG);
+      deps.restoreConfigText(null);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("names only the skill when the run wrote no config", async () => {
+    pythonRepo();
+    const world = server(["tr-own-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [], auth: flagKey("tr-own-key"), answers: ["abort"] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(each.configured).toEqual([]);
+    expect(result.error?.message.split("\n")[0]).toBe(
+      `Setup cancelled — Claude Code was not run, so no code was changed. Setup kept the TraceRoot skill in ${SKILL}.`,
+    );
+  });
+
+  it("claims no skill it could not install", async () => {
+    pythonRepo();
+    // A file where the skills directory goes, so the install fails and is skipped.
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "skills"), "not a directory\n");
+    const world = server(["tr-own-key", TEST_GLOBEX]);
+    const each = setupRun(world, { listed: [], auth: flagKey("tr-own-key"), answers: ["abort"] });
+
+    const result = await runSetupMachine(each.ctx, each.deps);
+
+    expect(plain(each.err.data)).toContain("could not install the TraceRoot skill");
+    expect(result.error?.message.split("\n")[0]).toBe(
+      "Setup cancelled — Claude Code was not run, so no code was changed.",
+    );
+  });
+
+  // ── a typed answer the user interrupts ────────────────────────────────────
+
+  it("hands the key prompt its stage, so an interrupt there ends the run with 130", async () => {
+    // The production prompt raises `INTERRUPTED` for the stage it is handed
+    // (see `readAnswer`); this is the one that asks for a pasted key.
+    const { SetupError } = await import("../../src/setup/errors.js");
+    pythonRepo();
+    const each = setupRun(server(), { listed: [] });
+    const stages: string[] = [];
+    const deps: SetupDeps = {
+      ...each.deps,
+      readCredential: () => null,
+      promptHidden: async (_question, stage) => {
+        stages.push(stage);
+        throw new SetupError({ stage, code: "INTERRUPTED", message: "Setup interrupted." });
+      },
+    };
+
+    const result = await runSetupMachine(each.ctx, deps);
+
+    expect(stages).toEqual(["authenticate"]);
+    expect(result.error?.code).toBe("INTERRUPTED");
+    expect(result.error?.stage).toBe("authenticate");
+    expect(result.error?.exitCode).toBe(130);
+  });
+
+  it("hands the new-project prompt its stage too", async () => {
+    const { SetupError } = await import("../../src/setup/errors.js");
+    pythonRepo();
+    const each = setupRun(server(), { listed: [] });
+    const stages: (string | undefined)[] = [];
+    const deps: SetupDeps = {
+      ...each.deps,
+      createSetupApi: (opts) => ({
+        ...each.deps.createSetupApi(opts),
+        listWorkspaces: async () => [{ id: "w_2", name: "Globex", role: "admin" }],
+      }),
+      prompt: async (_question, stage) => {
+        stages.push(stage);
+        throw new SetupError({
+          stage: stage ?? "complete",
+          code: "INTERRUPTED",
+          message: "Setup interrupted.",
+        });
+      },
+    };
+
+    const result = await runSetupMachine(each.ctx, deps);
+
+    expect(stages).toEqual(["authenticate"]);
+    expect(result.error?.code).toBe("INTERRUPTED");
+    expect(result.error?.exitCode).toBe(130);
   });
 });
 
@@ -3787,6 +4166,8 @@ describe("what a failed run takes back", () => {
   function signInThenFail(
     options: {
       revokeFails?: boolean;
+      /** What the revoke route answers instead, in the client's own shape. */
+      revokeError?: Error;
       /** Let the run finish instead, so the success path is reachable. */
       succeed?: boolean;
       /** Called where the failure happens, while the run is still in flight. */
@@ -3796,9 +4177,14 @@ describe("what a failed run takes back", () => {
     deps: SetupDeps;
     minted: string[];
     revoked: string[];
+    /** The project each revoke named, and every call to the route a sign-in cannot use. */
+    revokedIn: string[];
+    keyRouteCalls: string[];
   } {
     const minted: string[] = [];
     const revoked: string[] = [];
+    const revokedIn: string[] = [];
+    const keyRouteCalls: string[] = [];
     const setupApi = fakeSetupApi({
       listProjects: async () => [{ project_id: "p_1", project_name: "demo", workspace_id: "w_1" }],
       createProjectApiKey: async (input) => {
@@ -3813,11 +4199,21 @@ describe("what a failed run takes back", () => {
           key: `tr-${input.scope}-secret-value-${minted.length}`,
         };
       },
-      revokeApiKey: async (id) => {
+      // The route a user's own credential revokes through. The key-authenticated
+      // one refuses a sign-in, as the server's does.
+      revokeProjectApiKey: async (projectId, id) => {
+        if (options.revokeError !== undefined) {
+          throw options.revokeError;
+        }
         if (options.revokeFails === true) {
           throw new Error("the session was revoked while the run was in flight");
         }
         revoked.push(id);
+        revokedIn.push(projectId);
+      },
+      revokeApiKey: async (id) => {
+        keyRouteCalls.push(id);
+        throw new SetupApiError("Invalid API key", 401);
       },
     });
     const deps = makeDeps({
@@ -3840,6 +4236,8 @@ describe("what a failed run takes back", () => {
             },
       minted,
       revoked,
+      revokedIn,
+      keyRouteCalls,
     };
   }
 
@@ -3889,6 +4287,46 @@ describe("what a failed run takes back", () => {
     // And they stay in the durable record, because they are still out there.
     expect(ctx.checkpoint.mintedKeys?.map((key) => key.id)).toEqual(["ak_1", "ak_2"]);
   });
+
+  it("revokes them through their project's route, on the credential that minted them", async () => {
+    // They went to the key-authenticated route on the user's token, which
+    // accepts only an admin API key, so every one of them was reported live.
+    pythonRepo();
+    const { deps, revoked, revokedIn, keyRouteCalls } = signInThenFail();
+    const { ctx, err } = makeCtx({ canPrompt: true, flags: { browser: true, agent: "claude" } });
+
+    await runSetupMachine(ctx, deps);
+
+    expect(revoked).toEqual(["ak_1", "ak_2"]);
+    expect(revokedIn).toEqual(["p_1", "p_1"]);
+    expect(keyRouteCalls).toEqual([]);
+    expect(plain(err.data)).not.toContain("still live");
+    expect(ctx.checkpoint.mintedKeys).toEqual([]);
+  });
+
+  for (const [why, error] of [
+    [
+      "a deployment without that route",
+      new BackendUnavailableError("/api/v1/public/projects/p_1/api-keys/ak_1", 404),
+    ],
+    ["a role that may not revoke", new SetupApiError("Your role cannot revoke these keys", 403)],
+  ] as const) {
+    it(`still names them as live, and where to delete them, on ${why}`, async () => {
+      pythonRepo();
+      const { deps, revoked } = signInThenFail({ revokeError: error });
+      const { ctx, err } = makeCtx({ canPrompt: true, flags: { browser: true, agent: "claude" } });
+
+      await runSetupMachine(ctx, deps);
+
+      expect(revoked).toEqual([]);
+      expect(plain(err.data)).toContain("could not revoke the 2 API keys traceroot-cli-");
+      expect(plain(err.data)).toContain(
+        "they are still live. Delete them from the project's API keys at https://api.example.test.",
+      );
+      expect(plain(err.data)).not.toContain("Revoked the");
+      expect(ctx.checkpoint.mintedKeys?.map((key) => key.id)).toEqual(["ak_1", "ak_2"]);
+    });
+  }
 
   it("writes a minted key to disk before the run can lose it", async () => {
     // The case this has to survive is a key minted and then not recorded
