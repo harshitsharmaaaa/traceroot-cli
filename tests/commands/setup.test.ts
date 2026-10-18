@@ -413,7 +413,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -448,7 +448,7 @@ describe("runSetup", () => {
       canPrompt: true,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [] }),
+        traces: [],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
         skipTraceWait: true,
       }),
@@ -485,7 +485,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey("tr-secret-key-for-json-test"),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -519,7 +519,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -535,7 +535,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: process2.run,
       }),
     });
@@ -559,7 +559,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -593,7 +593,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -622,7 +622,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -661,7 +661,7 @@ describe("runSetup", () => {
       canPrompt: false,
       setupDeps: makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       }),
     });
@@ -706,7 +706,7 @@ describe("runSetup", () => {
     const asked: string[] = [];
     const setupDeps = makeDeps({
       auth: authWithKey(),
-      client: fakeApiClient({ traces: [traceRow()] }),
+      traces: [traceRow()],
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
     });
     const inner = setupDeps.prompt;
@@ -762,7 +762,7 @@ describe("runSetup", () => {
       };
       const setupDeps = makeDeps({
         auth: authWithKey(),
-        client: fakeApiClient({ traces: [traceRow()] }),
+        traces: [traceRow()],
         runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
       });
       // The production prompt, against a terminal this test types into.
@@ -1005,7 +1005,7 @@ describe("the hosts a --handoff run resolves", () => {
       setupDeps: (auth) =>
         makeDeps({
           auth,
-          client: fakeApiClient({ traces: [traceRow()] }),
+          traces: [traceRow()],
           setupApi: fakeSetupApi({
             listProjects: async () => [
               { project_id: "p_1", project_name: "demo", workspace_id: "w_1" },
@@ -1245,12 +1245,10 @@ describe("finding a previous, unfinished run", () => {
     let polls = 0;
     const setupDeps = makeDeps({
       auth: authWithKey(),
-      client: fakeApiClient({
-        traces: () => {
-          polls += 1;
-          return [traceRow()];
-        },
-      }),
+      traces: () => {
+        polls += 1;
+        return [traceRow()];
+      },
     });
     const inner = setupDeps.select;
     setupDeps.select = async (input) => {
@@ -1299,7 +1297,7 @@ describe("finding a previous, unfinished run", () => {
       flags: defaultFlags({ agent: "claude", manual: true }),
       writers,
       canPrompt: false,
-      setupDeps: makeDeps({ auth: authWithKey(), client: fakeApiClient({ traces: [traceRow()] }) }),
+      setupDeps: makeDeps({ auth: authWithKey(), traces: [traceRow()] }),
     });
 
     expect(err.data).toContain("pass --resume to continue it");
@@ -1594,7 +1592,7 @@ describe("the question asked about a previous run", () => {
     const asked: string[] = [];
     const setupDeps = makeDeps({
       auth: authWithKey(),
-      client: fakeApiClient({ traces: [traceRow()] }),
+      traces: [traceRow()],
     });
     const inner = setupDeps.select;
     setupDeps.select = async (input) => {
@@ -1632,7 +1630,7 @@ describe("a checkpoint at the repository root that belongs to another service", 
     const asked: string[] = [];
     const setupDeps = makeDeps({
       auth: authWithKey(),
-      client: fakeApiClient({ traces: [traceRow()] }),
+      traces: [traceRow()],
     });
     const inner = setupDeps.select;
     setupDeps.select = async (input) => {
@@ -1681,7 +1679,7 @@ describe("the production block that closes a run", () => {
     const asked: string[] = [];
     const base = makeDeps({
       auth: authWithKey(KEY),
-      client: fakeApiClient({ traces: [traceRow()] }),
+      traces: [traceRow()],
       runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
     });
 
