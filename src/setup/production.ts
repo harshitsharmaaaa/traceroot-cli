@@ -3,13 +3,13 @@ import type { Prompt } from "../prompt.js";
 import { HOST_ENV, KEY_ENV, applicationEnvKeys } from "./envWrite.js";
 import type { StackLanguage } from "./types.js";
 import {
+  settleAcknowledgement,
   wizardAcknowledgement,
   wizardAside,
   wizardEmphasis,
   wizardEnvVar,
   wizardNote,
 } from "./wizard.js";
-import { settleAcknowledgement } from "./wizard.js";
 
 /**
  * The last thing a run says, and the only part of it about somewhere other than
