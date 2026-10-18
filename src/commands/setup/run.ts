@@ -41,6 +41,7 @@ import {
   jsonEmitter,
   stageLineEmitter,
 } from "../../setup/events.js";
+import { setupCommand } from "../../setup/invocation.js";
 import {
   type SetupDeps,
   applicationKeyLocation,
@@ -114,7 +115,7 @@ export function closingLine(result: SetupResult, ending: SetupEnding = {}): stri
   // "paused" is the word for that one only.
   return ending.traceWaitSkipped === true
     ? "TraceRoot local setup complete — no trace seen yet."
-    : "Setup paused — rerun `traceroot setup --resume` to finish.";
+    : `Setup paused — rerun \`${setupCommand()} --resume\` to finish.`;
 }
 
 /**
@@ -377,7 +378,7 @@ export async function runSetup(deps: RunSetupDeps): Promise<SetupResult> {
       // stopped the flow early. Say what happens next rather than implying success.
       wizardLine(
         { writers, json },
-        "\nSetup did not reach a first trace yet. Finish the instrumentation task, then run `traceroot setup --resume`.",
+        `\nSetup did not reach a first trace yet. Finish the instrumentation task, then run \`${setupCommand()} --resume\`.`,
       );
     } else {
       // The other way to end without a trace: the user stopped the wait. The

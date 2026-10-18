@@ -61,6 +61,7 @@ import {
 import { SetupError, backendUnsupported } from "./errors.js";
 import type { RunProcess } from "./exec.js";
 import { changedSince, isPathIgnored, readGitState } from "./git.js";
+import { setupCommand } from "./invocation.js";
 import { buildInvocation, launchAgent, prepareWritableDir, resolveNpmCacheDir } from "./launch.js";
 import { detectEnvFiles, detectPythonEnvironment } from "./python.js";
 import { writeSetupReport } from "./report.js";
@@ -518,7 +519,7 @@ async function confirmDirtyWorktree(
       stage: "precheck",
       code: "CANCELLED",
       message: "Setup cancelled — the repository has uncommitted changes.",
-      remedy: "Commit or stash them, then rerun `traceroot setup`.",
+      remedy: `Commit or stash them, then rerun \`${setupCommand()}\`.`,
     });
   }
 }
@@ -665,7 +666,7 @@ const authenticate: StageDefinition = {
             stage: "authenticate",
             code: "UNSAFE_OVERWRITE",
             message: `Could not reach ${host} to verify the existing TraceRoot credential, so setup stopped rather than replacing it.`,
-            remedy: "Check your connection and rerun `traceroot setup`.",
+            remedy: `Check your connection and rerun \`${setupCommand()}\`.`,
           });
         }
         wizardWarn(ctx, "the existing TraceRoot credential was rejected; signing in again");
@@ -722,7 +723,7 @@ const authenticate: StageDefinition = {
         message: "No TraceRoot credential is configured and setup cannot prompt for one.",
         remedy: [
           "Provide a key non-interactively:",
-          "  traceroot setup --api-key <key>",
+          `  ${setupCommand()} --api-key <key>`,
           "or set TRACEROOT_API_KEY, or run `traceroot login` first.",
         ].join("\n"),
       });
@@ -825,7 +826,7 @@ async function signInFallbackHint(host: string, deps: SetupDeps): Promise<string
       if (await deps.probeHost(candidate)) {
         lines.push(
           `A TraceRoot API is responding at ${candidate} — if that is your deployment, use it:`,
-          `  traceroot setup --host ${candidate}`,
+          `  ${setupCommand()} --host ${candidate}`,
           "",
         );
         break;
@@ -835,10 +836,10 @@ async function signInFallbackHint(host: string, deps: SetupDeps): Promise<string
 
   lines.push(
     "If you meant a different deployment, point the CLI at it:",
-    "  traceroot setup --host <url>        (or set TRACEROOT_HOST_URL)",
+    `  ${setupCommand()} --host <url>        (or set TRACEROOT_HOST_URL)`,
     "",
     "Otherwise sign in with a key instead:",
-    "  traceroot setup --no-browser",
+    `  ${setupCommand()} --no-browser`,
     "or set TRACEROOT_API_KEY before running setup.",
   );
   return lines.join("\n");
@@ -1023,7 +1024,7 @@ async function handoffSignIn(
       stage: "authenticate",
       code: "NOT_AUTHENTICATED",
       message: "The sign-in from the browser was not accepted.",
-      remedy: "Run `traceroot setup` again.",
+      remedy: `Run \`${setupCommand()}\` again.`,
     });
   }
   return true;
@@ -1095,7 +1096,7 @@ async function browserSignIn(
     // guessable from it.
     wizardWarn(
       ctx,
-      "Setup didn't complete in the browser. If you were creating an account, verify your email and run `traceroot setup` again.",
+      `Setup didn't complete in the browser. If you were creating an account, verify your email and run \`${setupCommand()}\` again.`,
     );
     throw err;
   }
@@ -1136,7 +1137,7 @@ async function browserSignIn(
       stage: "authenticate",
       code: "NOT_AUTHENTICATED",
       message: "The credential from browser sign-in was rejected immediately.",
-      remedy: "Run `traceroot setup` again.",
+      remedy: `Run \`${setupCommand()}\` again.`,
     });
   }
   return "ok";
@@ -1506,7 +1507,7 @@ const selectContext: StageDefinition = {
         throw backendUnsupported(
           "select_context",
           "Project selection",
-          "Use a project-scoped API key: `traceroot setup --api-key <project key>`.",
+          `Use a project-scoped API key: \`${setupCommand()} --api-key <project key>\`.`,
         );
       }
       if (
@@ -1570,7 +1571,7 @@ async function chooseWorkspace(
       stage,
       code: "AMBIGUOUS",
       message: `You belong to ${workspaces.length} workspaces, so setup cannot pick one for you.`,
-      remedy: `Create the project in the TraceRoot dashboard and rerun with --project, for example:\n  traceroot setup --project ${basename(ctx.root)}`,
+      remedy: `Create the project in the TraceRoot dashboard and rerun with --project, for example:\n  ${setupCommand()} --project ${basename(ctx.root)}`,
     });
   }
 
@@ -1734,7 +1735,7 @@ async function chooseProject(
         stage,
         code: "AMBIGUOUS",
         message: "This workspace has no projects yet.",
-        remedy: "Create one with `traceroot setup --project <name>` in an interactive terminal.",
+        remedy: `Create one with \`${setupCommand()} --project <name>\` in an interactive terminal.`,
       });
     }
     // Which workspace to create it in. The caller supplies one only when it
@@ -1763,7 +1764,7 @@ async function chooseProject(
       stage,
       code: "AMBIGUOUS",
       message: `This workspace has ${projects.length} projects, so setup cannot pick one for you.`,
-      remedy: `Choose one with --project, for example:\n  traceroot setup --project ${first.project_name}`,
+      remedy: `Choose one with --project, for example:\n  ${setupCommand()} --project ${first.project_name}`,
     });
   }
 
@@ -1817,9 +1818,9 @@ async function confirmProjectSwitch(
     namedBy: ctx.flags.project === undefined ? undefined : "--project",
     move: [
       "To move this repository to that project, name it:",
-      `  traceroot setup --project ${chosen.projectId}`,
+      `  ${setupCommand()} --project ${chosen.projectId}`,
     ],
-    keep: "Rerun `traceroot setup` and accept the project it opens on.",
+    keep: `Rerun \`${setupCommand()}\` and accept the project it opens on.`,
   },
 ): Promise<void> {
   if (existing === null || existing.who.project_id === chosen.projectId) {
@@ -1970,7 +1971,7 @@ const acquireProjectKey: StageDefinition = {
           "Creating a project API key",
           [
             "Provide a project key instead:",
-            "  traceroot setup --api-key <project key>",
+            `  ${setupCommand()} --api-key <project key>`,
             `or add ${KEY_ENV}=<project key> to ${relativeToRoot(ctx.root, credentialEnvPath(ctx))} and rerun setup.`,
           ].join("\n"),
         );
@@ -2082,9 +2083,9 @@ async function settleSessionKey(
               : "--project",
         move: [
           "To move this repository to that project, pass that project's key:",
-          "  traceroot setup --api-key <key>",
+          `  ${setupCommand()} --api-key <key>`,
         ],
-        keep: "To set it up where it is, rerun with that project's key: `traceroot setup --api-key <key>`.",
+        keep: `To set it up where it is, rerun with that project's key: \`${setupCommand()} --api-key <key>\`.`,
       },
     );
   }
@@ -2283,7 +2284,7 @@ async function repositoryKey(
       stage,
       code: "UNSAFE_OVERWRITE",
       message: `A TraceRoot key is already present in ${envEntry} but could not be verified (${host} was unreachable), so setup stopped rather than replacing it.`,
-      remedy: "Check your connection and rerun `traceroot setup`.",
+      remedy: `Check your connection and rerun \`${setupCommand()}\`.`,
     });
   }
 }
@@ -2314,7 +2315,7 @@ async function reuseExistingKey(
       message: `${envEntry} already contains a working TraceRoot key for project '${who.project_name ?? who.project_id}', but setup selected '${ctx.project?.projectName}'.`,
       remedy: [
         "Run setup for that project instead:",
-        `  traceroot setup --project ${who.project_name ?? who.project_id}`,
+        `  ${setupCommand()} --project ${who.project_name ?? who.project_id}`,
         `or remove ${KEY_ENV} from ${envEntry} if it is stale.`,
       ].join("\n"),
     });
@@ -2820,7 +2821,7 @@ async function askForLanguage(
       message: `No Python or TypeScript/JavaScript application was found in ${ctx.root}.${unsupported}`,
       remedy: [
         "Run setup from the directory that holds a supported application, or point at it:",
-        "  traceroot setup --service <path> --language <python|typescript>",
+        `  ${setupCommand()} --service <path> --language <python|typescript>`,
       ].join("\n"),
     });
   }
@@ -2847,8 +2848,8 @@ async function askForLanguage(
             : `No Python or TypeScript/JavaScript application was detected in ${ctx.root}.${unsupported}`,
         remedy: [
           "Say which language to instrument:",
-          "  traceroot setup --language python",
-          "  traceroot setup --language typescript",
+          `  ${setupCommand()} --language python`,
+          `  ${setupCommand()} --language typescript`,
         ].join("\n"),
       });
     }
@@ -3508,7 +3509,7 @@ const instrument: StageDefinition = {
       recordHandover(ctx, agent.id, "task-file");
       wizardLine(
         ctx,
-        `\nWrote the instrumentation task to ${displaySkillPath(ctx.root, promptPath)}.\n${runTaskSentence(ctx, "it")}, then rerun \`traceroot setup --resume\`.`,
+        `\nWrote the instrumentation task to ${displaySkillPath(ctx.root, promptPath)}.\n${runTaskSentence(ctx, "it")}, then rerun \`${setupCommand()} --resume\`.`,
       );
       return "skipped";
     }
@@ -3798,8 +3799,8 @@ const instrument: StageDefinition = {
           code: "UNSUPPORTED",
           message: `Could not start ${adapter.displayName}.`,
           remedy: [
-            "Install it and rerun `traceroot setup --resume`, or generate the task instead:",
-            "  traceroot setup --no-instrument",
+            `Install it and rerun \`${setupCommand()} --resume\`, or generate the task instead:`,
+            `  ${setupCommand()} --no-instrument`,
           ].join("\n"),
         });
       }
@@ -3820,7 +3821,7 @@ const instrument: StageDefinition = {
           remedy: [
             "Nothing was reverted — your changes are intact.",
             ...agentEvidence(),
-            "Fix the issue and rerun `traceroot setup --resume`.",
+            `Fix the issue and rerun \`${setupCommand()} --resume\`.`,
           ].join("\n"),
         });
       }
@@ -3864,9 +3865,9 @@ const instrument: StageDefinition = {
             "An agent that reports no edits was usually stopped from making them — a refused command, or a package install with nowhere writable to cache.",
             ...agentEvidence(),
             "Clear what blocked it and rerun:",
-            "  traceroot setup --resume",
+            `  ${setupCommand()} --resume`,
             "Or write the task out and run it yourself:",
-            "  traceroot setup --no-instrument",
+            `  ${setupCommand()} --no-instrument`,
           ].join("\n"),
         });
       }
@@ -3934,9 +3935,9 @@ const instrument: StageDefinition = {
               "Exit 0 is the agent saying it finished, not that it wired anything up — a refused command and an exhausted context both end that way.",
               ...agentEvidence(),
               "Nothing was reverted, so a rerun picks up from whatever it did get done:",
-              "  traceroot setup --resume",
+              `  ${setupCommand()} --resume`,
               "Or write the task out and run it yourself:",
-              "  traceroot setup --no-instrument",
+              `  ${setupCommand()} --no-instrument`,
             ].join("\n"),
           });
         }
@@ -3955,7 +3956,7 @@ const instrument: StageDefinition = {
           message: `${adapter.displayName} finished, but \`import ${sdkCheck.check.module}\` fails under ${sdkCheck.check.display} — the ${sdk.package} SDK was not installed, so the instrumented code cannot run.`,
           remedy: [
             ...agentEvidence(),
-            "Install it yourself, then rerun `traceroot setup --resume`:",
+            `Install it yourself, then rerun \`${setupCommand()} --resume\`:`,
             `  ${install}`,
             // Only for the `pip` form. `uv` and `poetry` manage their own
             // environment, so PEP 668 cannot be what stopped them and saying so
@@ -4034,8 +4035,8 @@ async function confirmAgentLaunch(
       message: `Setup cancelled — ${agentName} was not run, so no code was changed.${keptOnCancel(ctx)}`,
       remedy: [
         "To get the same instructions without an agent editing anything:",
-        "  traceroot setup --no-instrument     writes the task for your own agent",
-        "  traceroot setup --manual            prints the steps",
+        `  ${setupCommand()} --no-instrument     writes the task for your own agent`,
+        `  ${setupCommand()} --manual            prints the steps`,
       ].join("\n"),
     });
   }
@@ -4254,8 +4255,7 @@ const verifyApplicationStage: StageDefinition = {
         stage: "verify_application",
         code: "APP_VERIFICATION_FAILED",
         message,
-        remedy:
-          "Nothing was reverted. Fix the failure, then rerun `traceroot setup --resume` to finish verification.",
+        remedy: `Nothing was reverted. Fix the failure, then rerun \`${setupCommand()} --resume\` to finish verification.`,
       });
     }
 
@@ -4474,8 +4474,8 @@ const verifyTrace: StageDefinition = {
         ].join(" "),
         remedy:
           task === null
-            ? ["Apply the steps above, then:", "  traceroot setup --resume"].join("\n")
-            : [`${runTaskSentence(ctx, task)}, then:`, "  traceroot setup --resume"].join("\n"),
+            ? ["Apply the steps above, then:", `  ${setupCommand()} --resume`].join("\n")
+            : [`${runTaskSentence(ctx, task)}, then:`, `  ${setupCommand()} --resume`].join("\n"),
       });
     }
 
@@ -4488,7 +4488,7 @@ const verifyTrace: StageDefinition = {
         code: "TRACE_TIMEOUT",
         message:
           "No trace yet, and nothing has run your application — setup found no test or health command to run, so the instrumented code was never executed.",
-        remedy: ["Run your application once, then:", "  traceroot setup --resume"].join("\n"),
+        remedy: ["Run your application once, then:", `  ${setupCommand()} --resume`].join("\n"),
       });
     }
 
@@ -4500,9 +4500,9 @@ const verifyTrace: StageDefinition = {
         remedy: [
           "The most common cause is that the instrumented code path never ran.",
           "Run your application once, then:",
-          "  traceroot setup --resume",
+          `  ${setupCommand()} --resume`,
           "To investigate:",
-          "  traceroot setup doctor",
+          `  ${setupCommand()} doctor`,
           "  traceroot traces list --limit 5",
         ].join("\n"),
       });

@@ -1,4 +1,5 @@
 import { posix, relative, resolve } from "node:path";
+import { setupCommand } from "./invocation.js";
 import type { ResolvedSdk } from "./sdk.js";
 import { installCommand } from "./sdk.js";
 import type { DetectedService } from "./types.js";
@@ -962,6 +963,6 @@ export function manualInstructions(input: {
     `       ${skillPath}/SKILL.md`,
     "",
     "  4. Run your application once so it emits a trace, then:",
-    "       traceroot setup --resume",
+    `       ${setupCommand()} --resume`,
   ].join("\n");
 }
