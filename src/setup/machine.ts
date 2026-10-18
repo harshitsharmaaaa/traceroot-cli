@@ -160,7 +160,8 @@ export interface SetupDeps {
   openBrowser: (url: string) => Promise<boolean>;
   /**
    * A typed answer. `stage` is the one an interrupt is blamed on, as a `select`
-   * names its own; a question asked outside the pipeline names none.
+   * names its own; the closing acknowledgements, asked after the pipeline, name
+   * `complete`.
    */
   prompt: (question: string, stage?: SetupStage) => Promise<string>;
   promptHidden: (question: string, stage: SetupStage) => Promise<string>;

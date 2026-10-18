@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { type Command, CommanderError } from "commander";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -30,6 +31,7 @@ import { ExitCode, isCliError, reportError } from "../../src/output.js";
 import { ALL_AGENTS } from "../../src/agents/index.js";
 import { LAUNCHABLE_AGENTS } from "../../src/setup/agents.js";
 import { SetupError } from "../../src/setup/errors.js";
+import { readAnswer } from "../../src/setup/machine.js";
 import { SETUP_STAGES } from "../../src/setup/types.js";
 import { WIZARD_TITLE } from "../../src/setup/wizard.js";
 import { StringSink } from "../helpers/stringSink.js";
@@ -39,6 +41,7 @@ import {
   authWithKey,
   defaultFlags,
   fakeApiClient,
+  fakeInput,
   fakeRunProcess,
   makeDeps,
   makeWriters,
@@ -604,6 +607,58 @@ describe("runSetup", () => {
       expect(line).toContain("(Press Enter to continue)");
     }
   });
+
+  for (const [at, which] of [
+    [0, "the traces one"],
+    [1, "the production one"],
+  ] as const) {
+    it(`ends with 130, not 0, on Ctrl+C at ${which} of the closing acknowledgements`, async () => {
+      // Readline closed on the keypress and the question never settled, so the
+      // event loop drained and `traceroot setup && <next step>` carried on.
+      writeFileSync(join(dir, "pyproject.toml"), '[project]\ndependencies = ["pytest"]\n');
+      writeFileSync(join(dir, "main.py"), "x = 1\n");
+      const input = fakeInput();
+      const output = new PassThrough();
+      let screen = "";
+      output.on("data", (chunk) => {
+        screen += String(chunk);
+      });
+      const shown = async (count: number): Promise<void> => {
+        while (screen.split("(Press Enter to continue)").length - 1 < count) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      };
+      const setupDeps = makeDeps({
+        auth: authWithKey(),
+        client: fakeApiClient({ traces: [traceRow()] }),
+        runProcess: fakeRunProcess({ gitStatus: ["", " M main.py"] }).run,
+      });
+      // The production prompt, against a terminal this test types into.
+      setupDeps.prompt = (question, stage) => readAnswer({ input, output }, question, { stage });
+
+      const run = runSetup({
+        ctx: ctxWith(),
+        cwd: dir,
+        flags: defaultFlags({ agent: "claude" }),
+        writers: makeWriters().writers,
+        canPrompt: true,
+        setupDeps,
+      });
+      for (let i = 0; i < at; i += 1) {
+        await shown(i + 1);
+        input.write("\r");
+      }
+      await shown(at + 1);
+      input.write("\x03");
+
+      await expect(run).rejects.toSatisfy((err: unknown) => {
+        expect(err).toBeInstanceOf(SetupError);
+        expect((err as SetupError).code).toBe("INTERRUPTED");
+        expect((err as SetupError).exitCode).toBe(130);
+        return true;
+      });
+    });
+  }
 
   it("notes when there is no checkpoint to resume", async () => {
     writeFileSync(join(dir, "go.mod"), "module x\n");
